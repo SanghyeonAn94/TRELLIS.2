@@ -88,21 +88,29 @@ class FlowEulerSampler(Sampler):
         cond: Optional[Any] = None,
         steps: int = 50,
         rescale_t: float = 1.0,
+        start_t: float = 1.0,
         verbose: bool = True,
         tqdm_desc: str = "Sampling",
+        inpaint_mask: Optional[torch.Tensor] = None,
+        inpaint_x0: Optional[torch.Tensor] = None,
+        inpaint_noise: Optional[torch.Tensor] = None,
         **kwargs
     ):
         """
         Generate samples from the model using Euler method.
-        
+
         Args:
             model: The model to sample from.
             noise: The initial noise tensor.
             cond: conditional information.
             steps: The number of steps to sample.
             rescale_t: The rescale factor for t.
+            start_t: The starting timestep (1.0 = full denoise, <1.0 = partial denoise for hires-fix).
             verbose: If True, show a progress bar.
             tqdm_desc: A customized tqdm desc.
+            inpaint_mask: Optional boolean tensor [N]. True = regenerate, False = keep original.
+            inpaint_x0: Optional tensor [N, C]. Normalized original features for known region.
+            inpaint_noise: Optional tensor [N, C]. Fixed noise for forward-noising the known region.
             **kwargs: Additional arguments for model_inference.
 
         Returns:
@@ -112,7 +120,7 @@ class FlowEulerSampler(Sampler):
             - 'pred_x_0': a list of prediction of x_0.
         """
         sample = noise
-        t_seq = np.linspace(1, 0, steps + 1)
+        t_seq = np.linspace(start_t, 0, steps + 1)
         t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq)
         t_seq = t_seq.tolist()
         t_pairs = list((t_seq[i], t_seq[i + 1]) for i in range(steps))
@@ -120,6 +128,13 @@ class FlowEulerSampler(Sampler):
         for t, t_prev in tqdm(t_pairs, desc=tqdm_desc, disable=not verbose):
             out = self.sample_once(model, sample, t, t_prev, cond, **kwargs)
             sample = out.pred_x_prev
+            # RePaint-style inpainting: replace known region with forward-noised x0
+            if inpaint_mask is not None:
+                sigma_t = self.sigma_min + (1 - self.sigma_min) * t_prev
+                x_known_noisy = (1 - t_prev) * inpaint_x0 + sigma_t * inpaint_noise
+                new_feats = sample.feats.clone()
+                new_feats[~inpaint_mask] = x_known_noisy[~inpaint_mask]
+                sample = sample.replace(feats=new_feats)
             ret.pred_x_t.append(out.pred_x_prev)
             ret.pred_x_0.append(out.pred_x_0)
         ret.samples = sample
@@ -139,13 +154,14 @@ class FlowEulerCfgSampler(ClassifierFreeGuidanceSamplerMixin, FlowEulerSampler):
         neg_cond,
         steps: int = 50,
         rescale_t: float = 1.0,
+        start_t: float = 1.0,
         guidance_strength: float = 3.0,
         verbose: bool = True,
         **kwargs
     ):
         """
         Generate samples from the model using Euler method.
-        
+
         Args:
             model: The model to sample from.
             noise: The initial noise tensor.
@@ -153,6 +169,7 @@ class FlowEulerCfgSampler(ClassifierFreeGuidanceSamplerMixin, FlowEulerSampler):
             neg_cond: negative conditional information.
             steps: The number of steps to sample.
             rescale_t: The rescale factor for t.
+            start_t: The starting timestep (1.0 = full denoise, <1.0 = partial denoise).
             guidance_strength: The strength of classifier-free guidance.
             verbose: If True, show a progress bar.
             **kwargs: Additional arguments for model_inference.
@@ -163,7 +180,7 @@ class FlowEulerCfgSampler(ClassifierFreeGuidanceSamplerMixin, FlowEulerSampler):
             - 'pred_x_t': a list of prediction of x_t.
             - 'pred_x_0': a list of prediction of x_0.
         """
-        return super().sample(model, noise, cond, steps, rescale_t, verbose, neg_cond=neg_cond, guidance_strength=guidance_strength, **kwargs)
+        return super().sample(model, noise, cond, steps, rescale_t, start_t, verbose, neg_cond=neg_cond, guidance_strength=guidance_strength, **kwargs)
 
 
 class FlowEulerGuidanceIntervalSampler(GuidanceIntervalSamplerMixin, ClassifierFreeGuidanceSamplerMixin, FlowEulerSampler):
@@ -179,6 +196,7 @@ class FlowEulerGuidanceIntervalSampler(GuidanceIntervalSamplerMixin, ClassifierF
         neg_cond,
         steps: int = 50,
         rescale_t: float = 1.0,
+        start_t: float = 1.0,
         guidance_strength: float = 3.0,
         guidance_interval: Tuple[float, float] = (0.0, 1.0),
         verbose: bool = True,
@@ -186,7 +204,7 @@ class FlowEulerGuidanceIntervalSampler(GuidanceIntervalSamplerMixin, ClassifierF
     ):
         """
         Generate samples from the model using Euler method.
-        
+
         Args:
             model: The model to sample from.
             noise: The initial noise tensor.
@@ -194,6 +212,7 @@ class FlowEulerGuidanceIntervalSampler(GuidanceIntervalSamplerMixin, ClassifierF
             neg_cond: negative conditional information.
             steps: The number of steps to sample.
             rescale_t: The rescale factor for t.
+            start_t: The starting timestep (1.0 = full denoise, <1.0 = partial denoise).
             guidance_strength: The strength of classifier-free guidance.
             guidance_interval: The interval for classifier-free guidance.
             verbose: If True, show a progress bar.
@@ -205,4 +224,4 @@ class FlowEulerGuidanceIntervalSampler(GuidanceIntervalSamplerMixin, ClassifierF
             - 'pred_x_t': a list of prediction of x_t.
             - 'pred_x_0': a list of prediction of x_0.
         """
-        return super().sample(model, noise, cond, steps, rescale_t, verbose, neg_cond=neg_cond, guidance_strength=guidance_strength, guidance_interval=guidance_interval, **kwargs)
+        return super().sample(model, noise, cond, steps, rescale_t, start_t, verbose, neg_cond=neg_cond, guidance_strength=guidance_strength, guidance_interval=guidance_interval, **kwargs)
