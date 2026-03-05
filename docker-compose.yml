@@ -1,0 +1,38 @@
+services:
+  trellis2:
+    image: trellis2
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - .:/workspace
+      - ./checkpoints:/workspace/checkpoints
+      - /data/geometry:/data/geometry:ro
+      - ./.cache:/root/.cache
+      - ./.cache/u2net:/root/.u2net
+      # 호스트 NVIDIA 드라이버 라이브러리
+      - /usr/lib/x86_64-linux-gnu/libcuda.so.590.48.01:/usr/lib/x86_64-linux-gnu/libcuda.so.1:ro
+      - /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.590.48.01:/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1:ro
+      - /usr/lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.590.48.01:/usr/lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.1:ro
+      - /usr/lib/x86_64-linux-gnu/libnvidia-gpucomp.so.590.48.01:/usr/lib/x86_64-linux-gnu/libnvidia-gpucomp.so.590.48.01:ro
+      - /usr/lib/x86_64-linux-gnu/libnvidia-nvvm.so.590.48.01:/usr/lib/x86_64-linux-gnu/libnvidia-nvvm.so.4:ro
+    devices:
+      - /dev/nvidia0
+      - /dev/nvidiactl
+      - /dev/nvidia-uvm
+      - /dev/nvidia-modeset
+      - /dev/dri/card1
+      - /dev/dri/renderD128
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/nvidia/cu13/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu
+      - OPENCV_IO_ENABLE_OPENEXR=1
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      - HF_TOKEN=${HF_TOKEN:-}
+    security_opt:
+      - label=disable
+    shm_size: '16g'
+    working_dir: /workspace
+    stdin_open: true
+    tty: true

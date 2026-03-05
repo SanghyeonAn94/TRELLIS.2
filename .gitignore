@@ -205,3 +205,26 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# 3D assets & media
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.glb
+*.gltf
+*.obj
+*.fbx
+*.stl
+*.ply
+*.mp4
+*.avi
+*.mov
+*.exr
+
+# Model checkpoints & cache
+checkpoints/
+.cache/
+
+# Outputs
+outputs/
