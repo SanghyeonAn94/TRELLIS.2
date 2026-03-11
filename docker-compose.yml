@@ -7,7 +7,6 @@ services:
     volumes:
       - .:/workspace
       - ./checkpoints:/workspace/checkpoints
-      - /data/geometry:/data/geometry:ro
       - ./.cache:/root/.cache
       - ./.cache/u2net:/root/.u2net
       # 호스트 NVIDIA 드라이버 라이브러리
@@ -17,12 +16,12 @@ services:
       - /usr/lib/x86_64-linux-gnu/libnvidia-gpucomp.so.590.48.01:/usr/lib/x86_64-linux-gnu/libnvidia-gpucomp.so.590.48.01:ro
       - /usr/lib/x86_64-linux-gnu/libnvidia-nvvm.so.590.48.01:/usr/lib/x86_64-linux-gnu/libnvidia-nvvm.so.4:ro
     devices:
-      - /dev/nvidia0
+      - /dev/nvidia${GPU_ID:-0}
       - /dev/nvidiactl
       - /dev/nvidia-uvm
       - /dev/nvidia-modeset
-      - /dev/dri/card1
-      - /dev/dri/renderD128
+      - /dev/dri/card${DRI_CARD:-1}
+      - /dev/dri/renderD${DRI_RENDER:-128}
     environment:
       - NVIDIA_VISIBLE_DEVICES=0
       - NVIDIA_DRIVER_CAPABILITIES=all

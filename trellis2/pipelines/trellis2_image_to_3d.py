@@ -1260,3 +1260,300 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         out_mesh = self.decode_latent(shape_slat_new, tex_slat_new, res)
 
         return out_mesh
+
+    @torch.no_grad()
+    def run_local_refine(
+        self,
+        image: Image.Image,
+        mask_vertices: np.ndarray,
+        seed: int = 42,
+        refine_seed: int = 456,
+        pipeline_type: Optional[str] = None,
+        local_resolution: int = 1536,
+        padding: int = 3,
+        refine_denoise_strength: float = 0.5,
+        refine_guidance_strength: float = 1.0,
+        mask_radius: int = 1,
+        sparse_structure_sampler_params: dict = {},
+        shape_slat_sampler_params: dict = {},
+        tex_slat_sampler_params: dict = {},
+        denoise_strength: float = 1.0,
+        max_num_tokens: int = 131072,
+    ) -> Tuple[List[MeshWithVoxel], List[MeshWithVoxel]]:
+        """
+        Local grid refinement: re-generate the masked region at much higher
+        voxel density by creating a local grid space covering only the mask AABB.
+
+        This is a "local cascade" — the same pattern as the existing cascade
+        (coarse→fine with decoder.upsample), but applied only to the masked region.
+
+        Args:
+            image: Input image prompt.
+            mask_vertices: [M, 3] mask mesh vertices in GLB Y-up space.
+            seed: Seed for reproducing the original generation.
+            refine_seed: Seed for local refinement noise.
+            pipeline_type: Pipeline type for original generation.
+            local_resolution: Resolution for the local grid (e.g. 1536 = 96³).
+            padding: AABB padding in coarse voxel units.
+            refine_denoise_strength: Denoise strength for local refinement
+                (0=keep coarse, 1=full denoise from noise).
+            refine_guidance_strength: CFG strength for refinement (low = more freedom).
+            mask_radius: Dilation radius for voxel mask.
+            sparse_structure_sampler_params: For original generation.
+            shape_slat_sampler_params: For original generation.
+            tex_slat_sampler_params: For original generation.
+            denoise_strength: For original cascade generation.
+            max_num_tokens: Maximum tokens for original generation.
+
+        Returns:
+            Tuple of (original_meshes, local_refined_meshes).
+            The local mesh is in global coordinates, covering only the AABB region.
+        """
+        pipeline_type = pipeline_type or self.default_pipeline_type
+        local_grid = local_resolution // 16
+
+        # Preprocess image once
+        preprocessed = self.preprocess_image(image)
+
+        # ── Step 1: Generate original ─────────────────────────────
+        print("[LocalRefine] Step 1/6: Generating original model...")
+        results = self.run(
+            preprocessed, seed=seed, return_latent=True,
+            preprocess_image=False,
+            pipeline_type=pipeline_type,
+            sparse_structure_sampler_params=sparse_structure_sampler_params,
+            shape_slat_sampler_params=shape_slat_sampler_params,
+            tex_slat_sampler_params=tex_slat_sampler_params,
+            denoise_strength=denoise_strength,
+            max_num_tokens=max_num_tokens,
+        )
+        orig_meshes, (shape_slat, tex_slat, res) = results
+        coarse_grid = res // 16
+        print(f"  Original: res={res}, grid={coarse_grid}³, voxels={shape_slat.coords.shape[0]}")
+
+        # ── Step 2: Extract mask AABB ─────────────────────────────
+        print("[LocalRefine] Step 2/6: Extracting mask AABB...")
+        mask = self.create_voxel_mask_from_mesh(
+            mask_vertices, shape_slat.coords, res, radius=mask_radius
+        )
+        n_masked = mask.sum().item()
+        print(f"  Mask: {n_masked}/{mask.shape[0]} voxels ({100*n_masked/mask.shape[0]:.1f}%)")
+
+        masked_coords_xyz = shape_slat.coords[mask][:, 1:]
+        aabb_min = masked_coords_xyz.min(dim=0).values - padding
+        aabb_max = masked_coords_xyz.max(dim=0).values + padding
+        aabb_min = aabb_min.clamp(min=0)
+        aabb_max = aabb_max.clamp(max=coarse_grid - 1)
+        aabb_size = (aabb_max - aabb_min + 1).float()
+        print(f"  AABB: min={aabb_min.tolist()}, max={aabb_max.tolist()}, size={aabb_size.tolist()}")
+
+        # ── Step 3: Extract AABB region + decoder.upsample ────────
+        print("[LocalRefine] Step 3/6: Creating local sparse structure...")
+
+        # Extract coarse voxels within AABB
+        coords_xyz = shape_slat.coords[:, 1:]
+        in_aabb = (
+            (coords_xyz[:, 0] >= aabb_min[0]) & (coords_xyz[:, 0] <= aabb_max[0]) &
+            (coords_xyz[:, 1] >= aabb_min[1]) & (coords_xyz[:, 1] <= aabb_max[1]) &
+            (coords_xyz[:, 2] >= aabb_min[2]) & (coords_xyz[:, 2] <= aabb_max[2])
+        )
+        local_coarse_feats = shape_slat.feats[in_aabb]
+        local_coarse_coords_xyz = coords_xyz[in_aabb]
+
+        # Keep ORIGINAL coords for decoder.upsample() — decoder needs
+        # proper spatial density to produce meaningful subdivisions.
+        local_coarse_coords_orig = torch.cat([
+            torch.zeros(local_coarse_coords_xyz.shape[0], 1, dtype=torch.int32, device=self.device),
+            local_coarse_coords_xyz,
+        ], dim=1)
+
+        local_coarse_slat = SparseTensor(
+            feats=local_coarse_feats,
+            coords=local_coarse_coords_orig,
+        )
+        print(f"  Coarse voxels in AABB: {local_coarse_coords_orig.shape[0]}")
+
+        # decoder.upsample() with original coords (proper spatial structure)
+        if self.low_vram:
+            self.models['shape_slat_decoder'].to(self.device)
+            self.models['shape_slat_decoder'].low_vram = True
+        raw_hr_coords = self.models['shape_slat_decoder'].upsample(local_coarse_slat, upsample_times=4)
+        if self.low_vram:
+            self.models['shape_slat_decoder'].cpu()
+            self.models['shape_slat_decoder'].low_vram = False
+
+        # Quantize raw HR coords to LOCAL grid [0, local_grid-1].
+        # Raw coords are at coarse_grid*16 = res scale (e.g. 1536).
+        # Map the AABB portion of that scale to [0, local_grid).
+        aabb_min_fine = aabb_min.float() * 16  # AABB min in fine (res) scale
+        aabb_size_fine = aabb_size * 16         # AABB size in fine (res) scale
+        quant_coords = torch.cat([
+            raw_hr_coords[:, :1],
+            ((raw_hr_coords[:, 1:].float() - aabb_min_fine.unsqueeze(0) + 0.5)
+             / aabb_size_fine.unsqueeze(0) * local_grid).int().clamp(0, local_grid - 1),
+        ], dim=1)
+        local_hr_coords = quant_coords.unique(dim=0)
+
+        # Also remap coarse coords to local grid for feature inheritance
+        local_coarse_in_local = torch.cat([
+            torch.zeros(local_coarse_coords_xyz.shape[0], 1, dtype=torch.int32, device=self.device),
+            ((local_coarse_coords_xyz.float() - aabb_min.unsqueeze(0) + 0.5)
+             / aabb_size.unsqueeze(0) * local_grid).int().clamp(0, local_grid - 1),
+        ], dim=1)
+        local_coarse_slat_remapped = SparseTensor(
+            feats=local_coarse_feats,
+            coords=local_coarse_in_local,
+        )
+
+        print(f"  Local HR voxels: {local_hr_coords.shape[0]} (target grid: {local_grid}³)")
+
+        # ── Step 4: Seed coarse features + partial denoise ────────
+        print("[LocalRefine] Step 4/6: Shape refinement...")
+
+        shape_std = torch.tensor(self.shape_slat_normalization['std'])[None].to(self.device)
+        shape_mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(self.device)
+
+        shape_flow_model = (
+            self.models['shape_slat_flow_model_512'] if pipeline_type == '512'
+            else self.models['shape_slat_flow_model_1024']
+        )
+
+        # Feature inheritance: coarse (remapped to local grid) → local HR (nearest-neighbor)
+        upsampled, found_mask = self._upsample_slat_features(
+            local_coarse_slat_remapped, local_hr_coords, local_grid, local_grid
+        )
+
+        # Normalize and prepare noisy input (cascade partial denoise pattern)
+        x0 = (upsampled.feats - shape_mean) / shape_std
+        C_model = shape_flow_model.in_channels
+        C_feat = x0.shape[1]
+        if C_feat < C_model:
+            x0 = torch.cat([x0, torch.zeros(x0.shape[0], C_model - C_feat, device=self.device)], dim=1)
+        elif C_feat > C_model:
+            x0 = x0[:, :C_model]
+
+        torch.manual_seed(refine_seed)
+        t = refine_denoise_strength
+        eps = torch.randn_like(x0)
+        if t >= 1.0:
+            noisy_input = eps
+            start_t = 1.0
+        else:
+            noisy_input = (1 - t) * x0 + t * eps
+            noisy_input[~found_mask] = eps[~found_mask]
+            start_t = t
+
+        print(f"  denoise_strength={t:.2f}, start_t={start_t:.2f}, tokens={local_hr_coords.shape[0]}")
+
+        noise = SparseTensor(
+            feats=noisy_input,
+            coords=local_hr_coords,
+        )
+
+        # Get conditioning
+        cond_res = 512 if pipeline_type == '512' else 1024
+        cond = self.get_cond([preprocessed], cond_res)
+
+        # NTK RoPE scaling if local grid exceeds model native
+        model_native_grid = 32 if pipeline_type == '512' else 64
+        saved_freqs = None
+        if local_grid > model_native_grid:
+            rope_scale = local_grid / model_native_grid
+            saved_freqs = self._apply_ntk_rope_scaling(shape_flow_model, rope_scale)
+            print(f"  NTK RoPE scaling: {model_native_grid}³→{local_grid}³ (scale={rope_scale:.1f})")
+
+        try:
+            refine_sampler_params = {
+                **self.shape_slat_sampler_params,
+                **shape_slat_sampler_params,
+                'guidance_strength': refine_guidance_strength,
+            }
+            if self.low_vram:
+                shape_flow_model.to(self.device)
+
+            local_shape_slat = self.shape_slat_sampler.sample(
+                shape_flow_model, noise,
+                **cond, **refine_sampler_params,
+                start_t=start_t,
+                verbose=True,
+                tqdm_desc="Local refine shape SLat",
+            ).samples
+
+            if self.low_vram:
+                shape_flow_model.cpu()
+
+            local_shape_slat = local_shape_slat * shape_std + shape_mean
+        finally:
+            if saved_freqs is not None:
+                self._restore_rope_freqs(shape_flow_model, saved_freqs)
+
+        # ── Step 5: Texture refinement ────────────────────────────
+        print("[LocalRefine] Step 5/6: Texture refinement...")
+
+        tex_std = torch.tensor(self.tex_slat_normalization['std'])[None].to(self.device)
+        tex_mean = torch.tensor(self.tex_slat_normalization['mean'])[None].to(self.device)
+
+        # Normalize refined shape as concat_cond
+        local_shape_norm = local_shape_slat.replace(
+            feats=(local_shape_slat.feats - shape_mean) / shape_std
+        )
+
+        tex_flow_model = (
+            self.models['tex_slat_flow_model_512'] if pipeline_type == '512'
+            else self.models['tex_slat_flow_model_1024']
+        )
+
+        tex_saved_freqs = None
+        if local_grid > model_native_grid:
+            tex_rope_scale = local_grid / model_native_grid
+            tex_saved_freqs = self._apply_ntk_rope_scaling(tex_flow_model, tex_rope_scale)
+
+        try:
+            torch.manual_seed(refine_seed + 1)
+            tex_in_channels = (
+                tex_flow_model.in_channels if isinstance(tex_flow_model, nn.Module)
+                else tex_flow_model[0].in_channels
+            )
+            tex_noise_channels = tex_in_channels - local_shape_norm.feats.shape[1]
+            tex_noise_feats = torch.randn(
+                local_shape_norm.coords.shape[0], tex_noise_channels
+            ).to(self.device)
+            tex_noise = local_shape_norm.replace(feats=tex_noise_feats)
+
+            tex_sampler_params = {
+                **self.tex_slat_sampler_params,
+                **tex_slat_sampler_params,
+            }
+            if self.low_vram:
+                tex_flow_model.to(self.device)
+
+            local_tex_slat = self.tex_slat_sampler.sample(
+                tex_flow_model, tex_noise,
+                concat_cond=local_shape_norm,
+                **cond, **tex_sampler_params,
+                verbose=True,
+                tqdm_desc="Local refine texture SLat",
+            ).samples
+
+            if self.low_vram:
+                tex_flow_model.cpu()
+
+            local_tex_slat = local_tex_slat * tex_std + tex_mean
+        finally:
+            if tex_saved_freqs is not None:
+                self._restore_rope_freqs(tex_flow_model, tex_saved_freqs)
+
+        # ── Step 6: Decode + coordinate transform ─────────────────
+        print("[LocalRefine] Step 6/6: Decoding local mesh...")
+        torch.cuda.empty_cache()
+        local_meshes = self.decode_latent(local_shape_slat, local_tex_slat, local_resolution)
+
+        # Compute AABB world-space info (for future stitching)
+        aabb_world_min = -0.5 + aabb_min.float() / coarse_grid
+        aabb_world_size = aabb_size / coarse_grid
+
+        print(f"  Local mesh vertices: {local_meshes[0].vertices.shape[0]:,}")
+        print(f"  AABB world: min={aabb_world_min.tolist()}, size={aabb_world_size.tolist()}")
+        print(f"  (Local mesh kept in [-0.5,0.5]³ space; transform info saved for stitching)")
+
+        return orig_meshes, local_meshes
