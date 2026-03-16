@@ -132,9 +132,14 @@ class FlowEulerSampler(Sampler):
             if inpaint_mask is not None:
                 sigma_t = self.sigma_min + (1 - self.sigma_min) * t_prev
                 x_known_noisy = (1 - t_prev) * inpaint_x0 + sigma_t * inpaint_noise
-                new_feats = sample.feats.clone()
-                new_feats[~inpaint_mask] = x_known_noisy[~inpaint_mask]
-                sample = sample.replace(feats=new_feats)
+                if hasattr(sample, 'feats'):
+                    # SparseTensor path (Stage 1/2: shape/texture SLat)
+                    new_feats = sample.feats.clone()
+                    new_feats[~inpaint_mask] = x_known_noisy[~inpaint_mask]
+                    sample = sample.replace(feats=new_feats)
+                else:
+                    # Dense tensor path (Stage 0: sparse structure)
+                    sample = torch.where(inpaint_mask, sample, x_known_noisy)
             ret.pred_x_t.append(out.pred_x_prev)
             ret.pred_x_0.append(out.pred_x_0)
         ret.samples = sample

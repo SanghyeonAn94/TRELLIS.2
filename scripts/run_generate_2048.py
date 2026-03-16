@@ -10,7 +10,7 @@ from trellis2.pipelines import Trellis2ImageTo3DPipeline
 import o_voxel
 
 CHECKPOINT = '/workspace/checkpoints/TRELLIS.2-4B'
-INPUT_IMAGE = '/workspace/assets/promote/input_image/2026-03-11_12-47-52_inpaint_1.png'
+INPUT_IMAGE = '/workspace/assets/promote/input_image/input image.png'
 OUTPUT_DIR = '/workspace/outputs/promote'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -43,16 +43,17 @@ results = pipeline.run(
     denoise_strength=1.0,
     max_num_tokens=131072,
 )
-meshes, (shape_slat, tex_slat, res) = results
+meshes, (shape_slat, tex_slat, res, z_s) = results
 t2 = time.time()
 print(f'Generation done: {t2-t1:.1f}s, res={res}, voxels={shape_slat.coords.shape[0]}')
 
-# Save latents for future regen/stitch
+# Save latents for future regen/stitch/recreate
 torch.save({
     'shape_slat_feats': shape_slat.feats.cpu(),
     'shape_slat_coords': shape_slat.coords.cpu(),
     'tex_slat_feats': tex_slat.feats.cpu(),
     'tex_slat_coords': tex_slat.coords.cpu(),
+    'z_s': z_s.cpu(),
     'res': res,
     'seed': SEED,
 }, f'{OUTPUT_DIR}/latents.pt')

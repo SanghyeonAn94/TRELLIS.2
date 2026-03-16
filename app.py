@@ -322,8 +322,8 @@ def preprocess_image(image: Image.Image) -> Image.Image:
     return processed_image
 
 
-def pack_state(latents: Tuple[SparseTensor, SparseTensor, int]) -> dict:
-    shape_slat, tex_slat, res = latents
+def pack_state(latents) -> dict:
+    shape_slat, tex_slat, res = latents[:3]
     return {
         'shape_slat_feats': shape_slat.feats.cpu().numpy(),
         'tex_slat_feats': tex_slat.feats.cpu().numpy(),

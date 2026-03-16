@@ -50,7 +50,7 @@ def export_mesh(mesh, path_prefix):
 
 # Generate original once
 print("Generating original...")
-_, (shape_slat, tex_slat, res) = pipeline.run(
+_, (shape_slat, tex_slat, res, _z_s) = pipeline.run(
     preprocessed, seed=SEED, return_latent=True, preprocess_image=False,
     pipeline_type='1024_1536', denoise_strength=1.0, max_num_tokens=131072, **ORIG_QUALITY)
 coarse_grid = res // 16

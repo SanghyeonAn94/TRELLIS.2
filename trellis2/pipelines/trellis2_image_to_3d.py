@@ -191,21 +191,38 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         resolution: int,
         num_samples: int = 1,
         sampler_params: dict = {},
+        return_latent: bool = False,
+        inpaint_mask: Optional[torch.Tensor] = None,
+        inpaint_x0: Optional[torch.Tensor] = None,
+        inpaint_noise: Optional[torch.Tensor] = None,
+        start_noise: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Sample sparse structures with the given conditioning.
-        
+
         Args:
             cond (dict): The conditioning information.
             resolution (int): The resolution of the sparse structure.
             num_samples (int): The number of samples to generate.
             sampler_params (dict): Additional parameters for the sampler.
+            return_latent (bool): Whether to also return z_s latent.
+            inpaint_mask (Optional[torch.Tensor]): [B, 1, R, R, R] bool mask for
+                Stage 0 inpainting. True = regenerate, False = keep original.
+            inpaint_x0 (Optional[torch.Tensor]): [B, C, R, R, R] original z_s latent
+                for the known (unmasked) region.
+            inpaint_noise (Optional[torch.Tensor]): [B, C, R, R, R] fixed noise for
+                forward-noising the known region.
+            start_noise (Optional[torch.Tensor]): Custom initial noise (e.g., noised z_s
+                for SDEdit-style partial denoise). If None, uses random noise.
         """
         # Sample sparse structure latent
         flow_model = self.models['sparse_structure_flow_model']
         reso = flow_model.resolution
         in_channels = flow_model.in_channels
-        noise = torch.randn(num_samples, in_channels, reso, reso, reso).to(self.device)
+        if start_noise is not None:
+            noise = start_noise
+        else:
+            noise = torch.randn(num_samples, in_channels, reso, reso, reso).to(self.device)
         sampler_params = {**self.sparse_structure_sampler_params, **sampler_params}
         if self.low_vram:
             flow_model.to(self.device)
@@ -214,12 +231,15 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             noise,
             **cond,
             **sampler_params,
+            inpaint_mask=inpaint_mask,
+            inpaint_x0=inpaint_x0,
+            inpaint_noise=inpaint_noise,
             verbose=True,
             tqdm_desc="Sampling sparse structure",
         ).samples
         if self.low_vram:
             flow_model.cpu()
-        
+
         # Decode sparse structure latent
         decoder = self.models['sparse_structure_decoder']
         if self.low_vram:
@@ -232,6 +252,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             decoded = torch.nn.functional.max_pool3d(decoded.float(), ratio, ratio, 0) > 0.5
         coords = torch.argwhere(decoded)[:, [0, 2, 3, 4]].int()
 
+        if return_latent:
+            return coords, z_s
         return coords
 
     def sample_shape_slat(
@@ -885,10 +907,15 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         cond_512 = self.get_cond([image], 512)
         cond_1024 = self.get_cond([image], 1024) if pipeline_type != '512' else None
         ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32, '2048_cascade': 32, '1024_1536': 64, '1024_2048': 64}[pipeline_type]
-        coords = self.sample_sparse_structure(
+        ss_result = self.sample_sparse_structure(
             cond_512, ss_res,
-            num_samples, sparse_structure_sampler_params
+            num_samples, sparse_structure_sampler_params,
+            return_latent=return_latent,
         )
+        if return_latent:
+            coords, z_s = ss_result
+        else:
+            coords = ss_result
         if pipeline_type == '512':
             shape_slat = self.sample_shape_slat(
                 cond_512, self.models['shape_slat_flow_model_512'],
@@ -1007,7 +1034,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         torch.cuda.empty_cache()
         out_mesh = self.decode_latent(shape_slat, tex_slat, res)
         if return_latent:
-            return out_mesh, (shape_slat, tex_slat, res)
+            return out_mesh, (shape_slat, tex_slat, res, z_s)
         else:
             return out_mesh
 
@@ -1065,6 +1092,61 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         mask[valid] = occupied[xyz[valid, 0], xyz[valid, 1], xyz[valid, 2]]
 
         return torch.tensor(mask, dtype=torch.bool, device=slat_coords.device)
+
+    @staticmethod
+    def create_dense_structure_mask(
+        mask_vertices: np.ndarray,
+        latent_res: int = 16,
+        decoded_res: int = 64,
+        radius: int = 1,
+        device: torch.device = torch.device('cuda'),
+    ) -> torch.Tensor:
+        """
+        Create a dense 3D mask at sparse structure latent resolution for Stage 0 inpainting.
+
+        Args:
+            mask_vertices (np.ndarray): [M, 3] vertices in [-0.5, 0.5]^3 (GLB Y-up).
+            latent_res (int): Latent resolution of SS flow model (default 16).
+            decoded_res (int): Decoded occupancy resolution (default 64).
+            radius (int): Dilation radius in decoded-resolution voxels.
+            device (torch.device): Target device.
+
+        Returns:
+            torch.Tensor: [1, 1, latent_res, latent_res, latent_res] bool mask.
+                True = regenerate, False = keep original.
+        """
+        # GLB Y-up → SLat Z-up coordinate transform
+        mask_vertices = np.column_stack([
+            mask_vertices[:, 0],
+            -mask_vertices[:, 2],
+            mask_vertices[:, 1],
+        ])
+
+        # Vertices [-0.5, 0.5] → decoded_res grid coordinates
+        voxel_coords = (mask_vertices + 0.5) * decoded_res
+        voxel_ints = np.clip(np.round(voxel_coords).astype(int), 0, decoded_res - 1)
+
+        # Build occupancy at decoded resolution
+        occupied = np.zeros((decoded_res,) * 3, dtype=bool)
+        occupied[voxel_ints[:, 0], voxel_ints[:, 1], voxel_ints[:, 2]] = True
+
+        # Dilate by radius at decoded resolution
+        if radius > 0:
+            padded = np.pad(occupied, radius, mode='constant', constant_values=False)
+            dilated = np.zeros_like(occupied)
+            for dx in range(2 * radius + 1):
+                for dy in range(2 * radius + 1):
+                    for dz in range(2 * radius + 1):
+                        dilated |= padded[dx:dx+decoded_res, dy:dy+decoded_res, dz:dz+decoded_res]
+            occupied = dilated
+
+        # Downscale to latent resolution via max_pool3d
+        # Any occupied voxel in a block marks the latent voxel as masked
+        occupied_t = torch.tensor(occupied, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        ratio = decoded_res // latent_res
+        mask_latent = torch.nn.functional.max_pool3d(occupied_t, ratio, ratio, 0) > 0.5
+
+        return mask_latent.to(device)
 
     @torch.no_grad()
     def run_inpaint(
@@ -1133,7 +1215,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             denoise_strength=denoise_strength,
             max_num_tokens=max_num_tokens,
         )
-        _, (shape_slat, tex_slat, res) = results
+        _, (shape_slat, tex_slat, res, _z_s) = results
 
         # ── Step 2: Create voxel mask ─────────────────────────────
         print("[Inpaint] Step 2/5: Creating voxel mask...")
@@ -1262,6 +1344,330 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         return out_mesh
 
     @torch.no_grad()
+    def run_recreate(
+        self,
+        image: Image.Image,
+        mask_vertices: np.ndarray,
+        z_s: torch.Tensor,
+        shape_slat: SparseTensor,
+        tex_slat: SparseTensor,
+        res: int,
+        recreate_seed: int = 789,
+        pipeline_type: Optional[str] = None,
+        sparse_structure_sampler_params: dict = {},
+        shape_slat_sampler_params: dict = {},
+        tex_slat_sampler_params: dict = {},
+        denoise_strength: float = 1.0,
+        max_num_tokens: int = 131072,
+        mask_radius: int = 1,
+        feather: int = 2,
+        recreate_ss_sampler_params: Optional[dict] = None,
+        ss_start_t: float = 0.5,
+    ) -> List[MeshWithVoxel]:
+        """
+        Recreate: regenerate sparse structure (Stage 0) in the masked region,
+        then generate shape/texture on merged coords and stitch with original features.
+
+        Unlike regen/repaint which only change features at existing voxel positions,
+        recreate can add/remove voxels - enabling entirely new geometry.
+
+        Args:
+            image: Conditioning image for the recreated region.
+            mask_vertices: [M, 3] vertices of the mask mesh in [-0.5, 0.5]^3.
+            z_s: [B, C, R, R, R] original Stage 0 latent from generation.
+            shape_slat: Original shape SLat (HR features from latents.pt).
+            tex_slat: Original texture SLat (HR features from latents.pt).
+            res: Resolution of the original generation (e.g., 1536).
+            recreate_seed: Seed for new content in the masked region.
+            pipeline_type: Pipeline type (default: self.default_pipeline_type).
+            sparse_structure_sampler_params: SS sampler overrides for recreate.
+            shape_slat_sampler_params: Shape SLat sampler overrides.
+            tex_slat_sampler_params: Texture SLat sampler overrides.
+            denoise_strength: Denoise strength for cascade generation.
+            max_num_tokens: Maximum number of tokens.
+            mask_radius: Dilation radius for mask (in decoded-resolution voxels).
+            feather: Feather blending width in voxels at HR resolution.
+            recreate_ss_sampler_params: SS sampler overrides for recreate pass.
+                If None, uses sparse_structure_sampler_params.
+            ss_start_t: Start timestep for Stage 0 SDEdit (0.0-1.0).
+                Lower = closer to original structure, higher = more freedom.
+                Default 0.5 preserves structure well while allowing conditioning.
+
+        Returns:
+            List[MeshWithVoxel]: The recreated meshes (full model with stitching).
+        """
+        pipeline_type = pipeline_type or self.default_pipeline_type
+
+        if recreate_ss_sampler_params is None:
+            recreate_ss_sampler_params = sparse_structure_sampler_params
+
+        preprocessed = self.preprocess_image(image)
+        z_s = z_s.to(self.device)
+
+        # ── Step 1: Create dense 3D mask at latent resolution ─────
+        print("[Recreate] Step 1/6: Creating dense structure mask...")
+        flow_model = self.models['sparse_structure_flow_model']
+        latent_res = flow_model.resolution  # 16
+        decoder = self.models['sparse_structure_decoder']
+
+        if self.low_vram:
+            decoder.to(self.device)
+        orig_decoded = decoder(z_s) > 0  # [B, 1, D, D, D]
+        if self.low_vram:
+            decoder.cpu()
+        decoded_res = orig_decoded.shape[2]
+
+        mask_latent = self.create_dense_structure_mask(
+            mask_vertices, latent_res=latent_res, decoded_res=decoded_res,
+            radius=mask_radius, device=self.device,
+        )
+        print(f"  Latent mask: {mask_latent.sum().item()}/{mask_latent.numel()} "
+              f"({100*mask_latent.sum().item()/mask_latent.numel():.1f}%)")
+
+        mask_decoded = self.create_dense_structure_mask(
+            mask_vertices, latent_res=decoded_res, decoded_res=decoded_res,
+            radius=mask_radius, device=self.device,
+        )
+
+        # ── Step 2: Stage 0 SDEdit + inpainting ─────────────────
+        print(f"[Recreate] Step 2/6: Recreating sparse structure (ss_start_t={ss_start_t})...")
+        cond_512 = self.get_cond([preprocessed], 512)
+        ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32,
+                  '2048_cascade': 32, '1024_1536': 64, '1024_2048': 64}[pipeline_type]
+
+        torch.manual_seed(recreate_seed)
+        inpaint_noise = torch.randn_like(z_s)
+
+        # SDEdit: start from noised z_s instead of pure noise
+        # This seeds the mask region with existing structure so the model
+        # modifies rather than generates from scratch
+        sigma_min = self.sparse_structure_sampler.sigma_min
+        sigma_start = sigma_min + (1 - sigma_min) * ss_start_t
+        start_noise = (1 - ss_start_t) * z_s + sigma_start * inpaint_noise
+
+        ss_params = {**recreate_ss_sampler_params, 'start_t': ss_start_t}
+        new_coords, new_z_s = self.sample_sparse_structure(
+            cond_512, ss_res,
+            num_samples=1,
+            sampler_params=ss_params,
+            return_latent=True,
+            inpaint_mask=mask_latent,
+            inpaint_x0=z_s,
+            inpaint_noise=inpaint_noise,
+            start_noise=start_noise,
+        )
+
+        if self.low_vram:
+            decoder.to(self.device)
+        new_decoded = decoder(new_z_s) > 0
+        if self.low_vram:
+            decoder.cpu()
+
+        # ── Step 3: Merge occupancy ───────────────────────────────
+        print("[Recreate] Step 3/6: Merging occupancy...")
+        orig_in_mask = int((orig_decoded & mask_decoded).sum())
+        new_in_mask = int((new_decoded & mask_decoded).sum())
+        print(f"  Occupancy in mask: {orig_in_mask} (orig) → {new_in_mask} (new)")
+
+        merged_decoded = torch.where(mask_decoded, new_decoded, orig_decoded)
+
+        if ss_res != merged_decoded.shape[2]:
+            ratio = merged_decoded.shape[2] // ss_res
+            merged_decoded = torch.nn.functional.max_pool3d(
+                merged_decoded.float(), ratio, ratio, 0
+            ) > 0.5
+        merged_coords = torch.argwhere(merged_decoded)[:, [0, 2, 3, 4]].int()
+        print(f"  Merged coarse voxels: {merged_coords.shape[0]}")
+
+        # ── Step 4: Stage 1 + Stage 2 on merged coords ───────────
+        print("[Recreate] Step 4/6: Generating shape & texture on merged structure...")
+        cond_1024 = self.get_cond([preprocessed], 1024) if pipeline_type != '512' else None
+        torch.manual_seed(recreate_seed)
+
+        if pipeline_type == '512':
+            shape_slat_new = self.sample_shape_slat(
+                cond_512, self.models['shape_slat_flow_model_512'],
+                merged_coords, shape_slat_sampler_params
+            )
+            tex_slat_new = self.sample_tex_slat(
+                cond_512, self.models['tex_slat_flow_model_512'],
+                shape_slat_new, tex_slat_sampler_params
+            )
+            new_res = 512
+        elif pipeline_type == '1024':
+            shape_slat_new = self.sample_shape_slat(
+                cond_1024, self.models['shape_slat_flow_model_1024'],
+                merged_coords, shape_slat_sampler_params
+            )
+            tex_slat_new = self.sample_tex_slat(
+                cond_1024, self.models['tex_slat_flow_model_1024'],
+                shape_slat_new, tex_slat_sampler_params
+            )
+            new_res = 1024
+        elif pipeline_type in ('1024_cascade', '1536_cascade'):
+            target_res = {'1024_cascade': 1024, '1536_cascade': 1536}[pipeline_type]
+            shape_slat_new, new_res = self.sample_shape_slat_cascade(
+                cond_512, cond_1024,
+                self.models['shape_slat_flow_model_512'],
+                self.models['shape_slat_flow_model_1024'],
+                512, target_res,
+                merged_coords, shape_slat_sampler_params,
+                max_num_tokens=max_num_tokens,
+                hr_rope_scale=target_res / 1024 if target_res > 1024 else None,
+                denoise_strength=denoise_strength,
+            )
+            tex_slat_new = self.sample_tex_slat(
+                cond_1024, self.models['tex_slat_flow_model_1024'],
+                shape_slat_new, tex_slat_sampler_params
+            )
+        elif pipeline_type == '2048_cascade':
+            shape_slat_new, new_res = self.sample_shape_slat_3stage_cascade(
+                cond_512, cond_1024,
+                self.models['shape_slat_flow_model_512'],
+                self.models['shape_slat_flow_model_1024'],
+                512, 1024, 2048,
+                merged_coords, shape_slat_sampler_params,
+                {},
+                denoise_strength,
+                max_num_tokens,
+            )
+            hr_grid = new_res // 16
+            mid_grid = 1024 // 16
+            tex_rope_scale = hr_grid / mid_grid
+            tex_saved_freqs = None
+            if tex_rope_scale > 1.0:
+                tex_saved_freqs = self._apply_ntk_rope_scaling(
+                    self.models['tex_slat_flow_model_1024'], tex_rope_scale)
+            try:
+                tex_slat_new = self.sample_tex_slat(
+                    cond_1024, self.models['tex_slat_flow_model_1024'],
+                    shape_slat_new, tex_slat_sampler_params
+                )
+            finally:
+                if tex_saved_freqs is not None:
+                    self._restore_rope_freqs(
+                        self.models['tex_slat_flow_model_1024'], tex_saved_freqs)
+        elif pipeline_type in ('1024_1536', '1024_2048'):
+            target_res = {'1024_1536': 1536, '1024_2048': 2048}[pipeline_type]
+            shape_slat_new, new_res = self.sample_shape_slat_cascade(
+                cond_1024, cond_1024,
+                self.models['shape_slat_flow_model_1024'],
+                self.models['shape_slat_flow_model_1024'],
+                1024, target_res,
+                merged_coords, shape_slat_sampler_params,
+                max_num_tokens=max_num_tokens,
+                hr_rope_scale=target_res / 1024,
+                denoise_strength=denoise_strength,
+            )
+            tex_slat_new = self.sample_tex_slat(
+                cond_1024, self.models['tex_slat_flow_model_1024'],
+                shape_slat_new, tex_slat_sampler_params
+            )
+        else:
+            raise ValueError(f"Unsupported pipeline type for recreate: {pipeline_type}")
+
+        # ── Step 5: Stitch with original features ─────────────────
+        print("[Recreate] Step 5/6: Stitching with original features...")
+        hr_grid = new_res // 16
+
+        # Create HR voxel mask on new coords
+        hr_mask_new = self.create_voxel_mask_from_mesh(
+            mask_vertices, shape_slat_new.coords, new_res, radius=mask_radius)
+
+        # Also create HR mask on original coords
+        hr_mask_orig = self.create_voxel_mask_from_mesh(
+            mask_vertices, shape_slat.coords, new_res, radius=mask_radius)
+
+        # Vectorized coord matching: new ↔ original
+        new_xyz = shape_slat_new.coords[:, 1:]  # [N_new, 3]
+        orig_xyz = shape_slat.coords[:, 1:].to(self.device)  # [N_orig, 3]
+        orig_shape_feats = shape_slat.feats.to(self.device)
+        orig_tex_feats = tex_slat.feats.to(self.device)
+
+        def coords_to_hash(xyz, grid):
+            return xyz[:, 0].long() * grid * grid + xyz[:, 1].long() * grid + xyz[:, 2].long()
+
+        new_hash = coords_to_hash(new_xyz, hr_grid)
+        orig_hash = coords_to_hash(orig_xyz, hr_grid)
+
+        orig_hash_sorted, orig_sort_idx = orig_hash.sort()
+        match_pos = torch.searchsorted(orig_hash_sorted, new_hash)
+        match_pos = match_pos.clamp(max=orig_hash_sorted.shape[0] - 1)
+        matched = orig_hash_sorted[match_pos] == new_hash
+        orig_matched_idx = orig_sort_idx[match_pos]
+
+        # Compute feather blend weights (mask distance based)
+        mask_coord_indices = hr_mask_new.nonzero(as_tuple=True)[0]
+        new_xyz_f = new_xyz.float()
+
+        if mask_coord_indices.numel() > 0:
+            mask_xyz_f = new_xyz_f[mask_coord_indices]
+            chunk_size = 4096
+            min_dists = torch.full((new_xyz_f.shape[0],), float('inf'), device=self.device)
+            for i in range(0, mask_xyz_f.shape[0], chunk_size):
+                mc = mask_xyz_f[i:i + chunk_size]
+                diffs = (new_xyz_f.unsqueeze(1) - mc.unsqueeze(0)).abs()
+                linf = diffs.max(dim=2).values.min(dim=1).values
+                min_dists = torch.min(min_dists, linf)
+            # 1.0 at mask, fading to 0.0 at feather distance
+            blend_w = (1.0 - (min_dists / max(feather, 1)).clamp(0, 1)).unsqueeze(1)
+        else:
+            blend_w = torch.zeros(new_xyz_f.shape[0], 1, device=self.device)
+
+        # Blend: new features where mask, original features where not mask
+        final_shape_feats = shape_slat_new.feats.clone()
+        final_tex_feats = tex_slat_new.feats.clone()
+
+        # For non-mask coords with original match: blend
+        has_orig = matched & ~hr_mask_new
+        if has_orig.any():
+            oi = orig_matched_idx[has_orig]
+            w = blend_w[has_orig]
+            final_shape_feats[has_orig] = (1 - w) * orig_shape_feats[oi] + w * final_shape_feats[has_orig]
+            final_tex_feats[has_orig] = (1 - w) * orig_tex_feats[oi] + w * final_tex_feats[has_orig]
+
+        # Also feather the boundary zone (matched + in feather range)
+        boundary = matched & hr_mask_new & (blend_w.squeeze(1) < 1.0)
+        if boundary.any():
+            oi = orig_matched_idx[boundary]
+            w = blend_w[boundary]
+            final_shape_feats[boundary] = (1 - w) * orig_shape_feats[oi] + w * final_shape_feats[boundary]
+            final_tex_feats[boundary] = (1 - w) * orig_tex_feats[oi] + w * final_tex_feats[boundary]
+
+        # Add back original non-mask coords missing from new set
+        new_hash_sorted = new_hash.sort()[0]
+        orig_in_new_pos = torch.searchsorted(new_hash_sorted, orig_hash)
+        orig_in_new_pos = orig_in_new_pos.clamp(max=new_hash_sorted.shape[0] - 1)
+        orig_in_new = new_hash_sorted[orig_in_new_pos] == orig_hash
+        missing = ~orig_in_new & ~hr_mask_orig
+        n_missing = missing.sum().item()
+        if n_missing > 0:
+            print(f"  Restoring {n_missing} missing original non-mask voxels")
+            missing_coords = shape_slat.coords[missing].to(self.device)
+            missing_shape = orig_shape_feats[missing]
+            missing_tex = orig_tex_feats[missing]
+            all_coords = torch.cat([shape_slat_new.coords, missing_coords])
+            final_shape_feats = torch.cat([final_shape_feats, missing_shape])
+            final_tex_feats = torch.cat([final_tex_feats, missing_tex])
+        else:
+            all_coords = shape_slat_new.coords
+
+        n_full_new = (hr_mask_new & (blend_w.squeeze(1) >= 1.0)).sum().item()
+        n_blended = ((blend_w.squeeze(1) > 0) & (blend_w.squeeze(1) < 1.0)).sum().item()
+        n_orig_kept = has_orig.sum().item() - n_blended
+        print(f"  Voxels: {n_orig_kept} original, {n_blended} blended, "
+              f"{n_full_new} new, {n_missing} restored")
+
+        stitched_shape = SparseTensor(feats=final_shape_feats, coords=all_coords)
+        stitched_tex = SparseTensor(feats=final_tex_feats, coords=all_coords)
+
+        # ── Step 6: Decode ────────────────────────────────────────
+        print("[Recreate] Step 6/6: Decoding...")
+        torch.cuda.empty_cache()
+        out_mesh = self.decode_latent(stitched_shape, stitched_tex, new_res)
+        return out_mesh
+
+    @torch.no_grad()
     def run_local_refine(
         self,
         image: Image.Image,
@@ -1327,7 +1733,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             denoise_strength=denoise_strength,
             max_num_tokens=max_num_tokens,
         )
-        orig_meshes, (shape_slat, tex_slat, res) = results
+        orig_meshes, (shape_slat, tex_slat, res, _z_s) = results
         coarse_grid = res // 16
         print(f"  Original: res={res}, grid={coarse_grid}³, voxels={shape_slat.coords.shape[0]}")
 
