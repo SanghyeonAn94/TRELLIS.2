@@ -1164,6 +1164,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         mask_radius: int = 1,
         inpaint_shape_slat_sampler_params: Optional[dict] = None,
         inpaint_tex_slat_sampler_params: Optional[dict] = None,
+        return_latent: bool = False,
     ) -> List[MeshWithVoxel]:
         """
         RePaint-style 3D inpainting: regenerate masked voxels while preserving the rest.
@@ -1341,6 +1342,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         torch.cuda.empty_cache()
         out_mesh = self.decode_latent(shape_slat_new, tex_slat_new, res)
 
+        if return_latent:
+            return out_mesh, (shape_slat_new, tex_slat_new, res, _z_s)
         return out_mesh
 
     @torch.no_grad()
@@ -1363,6 +1366,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         feather: int = 2,
         recreate_ss_sampler_params: Optional[dict] = None,
         ss_start_t: float = 0.5,
+        return_latent: bool = False,
     ) -> List[MeshWithVoxel]:
         """
         Recreate: regenerate sparse structure (Stage 0) in the masked region,
@@ -1665,6 +1669,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         print("[Recreate] Step 6/6: Decoding...")
         torch.cuda.empty_cache()
         out_mesh = self.decode_latent(stitched_shape, stitched_tex, new_res)
+        if return_latent:
+            return out_mesh, (stitched_shape, stitched_tex, new_res, new_z_s)
         return out_mesh
 
     @torch.no_grad()
