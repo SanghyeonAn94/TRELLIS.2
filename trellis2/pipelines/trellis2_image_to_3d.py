@@ -865,6 +865,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         max_num_tokens: int = 49152,
         denoise_strength: float = 0.5,
         hr_shape_slat_sampler_params: dict = {},
+        override_coords: Optional[torch.Tensor] = None,
     ) -> List[MeshWithVoxel]:
         """
         Run the pipeline.
@@ -906,16 +907,21 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         torch.manual_seed(seed)
         cond_512 = self.get_cond([image], 512)
         cond_1024 = self.get_cond([image], 1024) if pipeline_type != '512' else None
-        ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32, '2048_cascade': 32, '1024_1536': 64, '1024_2048': 64}[pipeline_type]
-        ss_result = self.sample_sparse_structure(
-            cond_512, ss_res,
-            num_samples, sparse_structure_sampler_params,
-            return_latent=return_latent,
-        )
-        if return_latent:
-            coords, z_s = ss_result
+        if override_coords is not None:
+            # Skip Stage 0: use externally provided coords (e.g. from voxelized mesh)
+            coords = override_coords
+            z_s = torch.zeros(1) if return_latent else None
         else:
-            coords = ss_result
+            ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32, '2048_cascade': 32, '1024_1536': 64, '1024_2048': 64}[pipeline_type]
+            ss_result = self.sample_sparse_structure(
+                cond_512, ss_res,
+                num_samples, sparse_structure_sampler_params,
+                return_latent=return_latent,
+            )
+            if return_latent:
+                coords, z_s = ss_result
+            else:
+                coords = ss_result
         if pipeline_type == '512':
             shape_slat = self.sample_shape_slat(
                 cond_512, self.models['shape_slat_flow_model_512'],
