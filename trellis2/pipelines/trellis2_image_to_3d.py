@@ -1132,9 +1132,11 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         voxel_coords = (mask_vertices + 0.5) * decoded_res
         voxel_ints = np.clip(np.round(voxel_coords).astype(int), 0, decoded_res - 1)
 
-        # Build occupancy at decoded resolution
+        # Build occupancy at decoded resolution — fill bounding box of mask vertices
         occupied = np.zeros((decoded_res,) * 3, dtype=bool)
-        occupied[voxel_ints[:, 0], voxel_ints[:, 1], voxel_ints[:, 2]] = True
+        bbox_min = voxel_ints.min(axis=0)
+        bbox_max = voxel_ints.max(axis=0)
+        occupied[bbox_min[0]:bbox_max[0]+1, bbox_min[1]:bbox_max[1]+1, bbox_min[2]:bbox_max[2]+1] = True
 
         # Dilate by radius at decoded resolution
         if radius > 0:
