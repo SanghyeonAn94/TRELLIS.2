@@ -1481,7 +1481,9 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         new_in_mask = int((new_decoded & mask_decoded).sum())
         print(f"  Occupancy in mask: {orig_in_mask} (orig) → {new_in_mask} (new)")
 
-        merged_decoded = torch.where(mask_decoded, new_decoded, orig_decoded)
+        # Union in mask: keep original voxels + add new ones (prevents holes)
+        # Features are fully regenerated via cascade regardless
+        merged_decoded = torch.where(mask_decoded, new_decoded | orig_decoded, orig_decoded)
 
         if ss_res != merged_decoded.shape[2]:
             ratio = merged_decoded.shape[2] // ss_res
