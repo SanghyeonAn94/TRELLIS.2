@@ -1132,11 +1132,9 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         voxel_coords = (mask_vertices + 0.5) * decoded_res
         voxel_ints = np.clip(np.round(voxel_coords).astype(int), 0, decoded_res - 1)
 
-        # Build occupancy at decoded resolution — fill bounding box of mask vertices
+        # Build occupancy at decoded resolution
         occupied = np.zeros((decoded_res,) * 3, dtype=bool)
-        bbox_min = voxel_ints.min(axis=0)
-        bbox_max = voxel_ints.max(axis=0)
-        occupied[bbox_min[0]:bbox_max[0]+1, bbox_min[1]:bbox_max[1]+1, bbox_min[2]:bbox_max[2]+1] = True
+        occupied[voxel_ints[:, 0], voxel_ints[:, 1], voxel_ints[:, 2]] = True
 
         # Dilate by radius at decoded resolution
         if radius > 0:
@@ -1481,9 +1479,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         new_in_mask = int((new_decoded & mask_decoded).sum())
         print(f"  Occupancy in mask: {orig_in_mask} (orig) → {new_in_mask} (new)")
 
-        # Union in mask: keep original voxels + add new ones (prevents holes)
-        # Features are fully regenerated via cascade regardless
-        merged_decoded = torch.where(mask_decoded, new_decoded | orig_decoded, orig_decoded)
+        merged_decoded = torch.where(mask_decoded, new_decoded, orig_decoded)
 
         if ss_res != merged_decoded.shape[2]:
             ratio = merged_decoded.shape[2] // ss_res
