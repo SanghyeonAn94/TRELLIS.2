@@ -1489,194 +1489,246 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         merged_coords = torch.argwhere(merged_decoded)[:, [0, 2, 3, 4]].int()
         print(f"  Merged coarse voxels: {merged_coords.shape[0]}")
 
-        # ── Step 4: Stage 1 + Stage 2 on merged coords ───────────
-        print("[Recreate] Step 4/6: Generating shape & texture on merged structure...")
-        cond_1024 = self.get_cond([preprocessed], 1024) if pipeline_type != '512' else None
-        torch.manual_seed(recreate_seed)
-
-        if pipeline_type == '512':
-            shape_slat_new = self.sample_shape_slat(
-                cond_512, self.models['shape_slat_flow_model_512'],
-                merged_coords, shape_slat_sampler_params
-            )
-            tex_slat_new = self.sample_tex_slat(
-                cond_512, self.models['tex_slat_flow_model_512'],
-                shape_slat_new, tex_slat_sampler_params
-            )
-            new_res = 512
-        elif pipeline_type == '1024':
-            shape_slat_new = self.sample_shape_slat(
-                cond_1024, self.models['shape_slat_flow_model_1024'],
-                merged_coords, shape_slat_sampler_params
-            )
-            tex_slat_new = self.sample_tex_slat(
-                cond_1024, self.models['tex_slat_flow_model_1024'],
-                shape_slat_new, tex_slat_sampler_params
-            )
-            new_res = 1024
-        elif pipeline_type in ('1024_cascade', '1536_cascade'):
-            target_res = {'1024_cascade': 1024, '1536_cascade': 1536}[pipeline_type]
-            shape_slat_new, new_res = self.sample_shape_slat_cascade(
-                cond_512, cond_1024,
-                self.models['shape_slat_flow_model_512'],
-                self.models['shape_slat_flow_model_1024'],
-                512, target_res,
-                merged_coords, shape_slat_sampler_params,
-                max_num_tokens=max_num_tokens,
-                hr_rope_scale=target_res / 1024 if target_res > 1024 else None,
-                denoise_strength=denoise_strength,
-            )
-            tex_slat_new = self.sample_tex_slat(
-                cond_1024, self.models['tex_slat_flow_model_1024'],
-                shape_slat_new, tex_slat_sampler_params
-            )
-        elif pipeline_type == '2048_cascade':
-            shape_slat_new, new_res = self.sample_shape_slat_3stage_cascade(
-                cond_512, cond_1024,
-                self.models['shape_slat_flow_model_512'],
-                self.models['shape_slat_flow_model_1024'],
-                512, 1024, 2048,
-                merged_coords, shape_slat_sampler_params,
-                {},
-                denoise_strength,
-                max_num_tokens,
-            )
-            hr_grid = new_res // 16
-            mid_grid = 1024 // 16
-            tex_rope_scale = hr_grid / mid_grid
-            tex_saved_freqs = None
-            if tex_rope_scale > 1.0:
-                tex_saved_freqs = self._apply_ntk_rope_scaling(
-                    self.models['tex_slat_flow_model_1024'], tex_rope_scale)
-            try:
-                tex_slat_new = self.sample_tex_slat(
-                    cond_1024, self.models['tex_slat_flow_model_1024'],
-                    shape_slat_new, tex_slat_sampler_params
-                )
-            finally:
-                if tex_saved_freqs is not None:
-                    self._restore_rope_freqs(
-                        self.models['tex_slat_flow_model_1024'], tex_saved_freqs)
-        elif pipeline_type in ('1024_1536', '1024_2048'):
-            target_res = {'1024_1536': 1536, '1024_2048': 2048}[pipeline_type]
-            shape_slat_new, new_res = self.sample_shape_slat_cascade(
-                cond_1024, cond_1024,
-                self.models['shape_slat_flow_model_1024'],
-                self.models['shape_slat_flow_model_1024'],
-                1024, target_res,
-                merged_coords, shape_slat_sampler_params,
-                max_num_tokens=max_num_tokens,
-                hr_rope_scale=target_res / 1024,
-                denoise_strength=denoise_strength,
-            )
-            tex_slat_new = self.sample_tex_slat(
-                cond_1024, self.models['tex_slat_flow_model_1024'],
-                shape_slat_new, tex_slat_sampler_params
-            )
-        else:
-            raise ValueError(f"Unsupported pipeline type for recreate: {pipeline_type}")
-
-        # ── Step 5: Stitch with original features ─────────────────
-        print("[Recreate] Step 5/6: Stitching with original features...")
+        # ── Step 4: Build merged HR coords + repaint features ─────
+        # Instead of cascade (which generates all features from scratch and
+        # requires post-hoc stitching), we:
+        #   1. Build merged HR coords from merged coarse structure
+        #   2. Map original features onto merged coords (non-mask)
+        #   3. Use repaint mechanism: flow model generates mask features
+        #      while seeing original features in context (self-attention)
+        print("[Recreate] Step 4/5: Repaint on merged structure...")
+        new_res = res  # Keep original resolution (e.g. 1536)
         hr_grid = new_res // 16
 
-        # Create HR voxel mask on new coords
-        hr_mask_new = self.create_voxel_mask_from_mesh(
-            mask_vertices, shape_slat_new.coords, new_res, radius=mask_radius)
+        cond_1024 = self.get_cond([preprocessed], 1024)
 
-        # Also create HR mask on original coords
-        hr_mask_orig = self.create_voxel_mask_from_mesh(
-            mask_vertices, shape_slat.coords, new_res, radius=mask_radius)
+        # Upsample merged coarse coords to HR via decoder
+        # First run LR flow to get features for upsampling
+        torch.manual_seed(recreate_seed)
+        _lr_fm = getattr(self.models['shape_slat_flow_model_512'], '_orig_mod',
+                         self.models['shape_slat_flow_model_512']).to(self.device)
+        lr_noise = SparseTensor(
+            feats=torch.randn(merged_coords.shape[0],
+                              _lr_fm.in_channels).to(self.device),
+            coords=merged_coords,
+        )
+        lr_sampler_params = {**self.shape_slat_sampler_params, **shape_slat_sampler_params}
+        lr_slat = self.shape_slat_sampler.sample(
+            _lr_fm,
+            lr_noise, **cond_512, **lr_sampler_params,
+            verbose=True, tqdm_desc="Recreate LR shape",
+        ).samples
+        std = torch.tensor(self.shape_slat_normalization['std'])[None].to(self.device)
+        mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(self.device)
+        lr_slat = lr_slat * std + mean
 
-        # Vectorized coord matching: new ↔ original
-        new_xyz = shape_slat_new.coords[:, 1:]  # [N_new, 3]
-        orig_xyz = shape_slat.coords[:, 1:].to(self.device)  # [N_orig, 3]
-        orig_shape_feats = shape_slat.feats.to(self.device)
-        orig_tex_feats = tex_slat.feats.to(self.device)
+        # Upsample to HR coords
+        if self.low_vram:
+            self.models['shape_slat_decoder'].to(self.device)
+            self.models['shape_slat_decoder'].low_vram = True
+        hr_coords_raw = self.models['shape_slat_decoder'].upsample(lr_slat, upsample_times=4)
+        if self.low_vram:
+            self.models['shape_slat_decoder'].cpu()
+            self.models['shape_slat_decoder'].low_vram = False
+        quant_coords = torch.cat([
+            hr_coords_raw[:, :1],
+            ((hr_coords_raw[:, 1:] + 0.5) / 512 * hr_grid).int(),
+        ], dim=1)
+        hr_coords = quant_coords.unique(dim=0)
+        print(f"  HR coords: {hr_coords.shape[0]} voxels (grid={hr_grid})")
 
+        # Create mask on HR coords
+        hr_mask = self.create_voxel_mask_from_mesh(
+            mask_vertices, hr_coords, new_res, radius=mask_radius)
+        n_masked = hr_mask.sum().item()
+        print(f"  HR mask: {n_masked}/{hr_coords.shape[0]} voxels ({100*n_masked/hr_coords.shape[0]:.1f}%)")
+
+        # Map original features onto HR coords
         def coords_to_hash(xyz, grid):
             return xyz[:, 0].long() * grid * grid + xyz[:, 1].long() * grid + xyz[:, 2].long()
 
-        new_hash = coords_to_hash(new_xyz, hr_grid)
+        hr_xyz = hr_coords[:, 1:]
+        orig_xyz = shape_slat.coords[:, 1:].to(self.device)
+        hr_hash = coords_to_hash(hr_xyz, hr_grid)
         orig_hash = coords_to_hash(orig_xyz, hr_grid)
 
         orig_hash_sorted, orig_sort_idx = orig_hash.sort()
-        match_pos = torch.searchsorted(orig_hash_sorted, new_hash)
+        match_pos = torch.searchsorted(orig_hash_sorted, hr_hash)
         match_pos = match_pos.clamp(max=orig_hash_sorted.shape[0] - 1)
-        matched = orig_hash_sorted[match_pos] == new_hash
+        matched = orig_hash_sorted[match_pos] == hr_hash
         orig_matched_idx = orig_sort_idx[match_pos]
 
-        # Compute feather blend weights (mask distance based)
-        mask_coord_indices = hr_mask_new.nonzero(as_tuple=True)[0]
-        new_xyz_f = new_xyz.float()
-
-        if mask_coord_indices.numel() > 0:
-            mask_xyz_f = new_xyz_f[mask_coord_indices]
-            chunk_size = 4096
-            min_dists = torch.full((new_xyz_f.shape[0],), float('inf'), device=self.device)
-            for i in range(0, mask_xyz_f.shape[0], chunk_size):
-                mc = mask_xyz_f[i:i + chunk_size]
-                diffs = (new_xyz_f.unsqueeze(1) - mc.unsqueeze(0)).abs()
-                linf = diffs.max(dim=2).values.min(dim=1).values
-                min_dists = torch.min(min_dists, linf)
-            # 1.0 at mask, fading to 0.0 at feather distance
-            blend_w = (1.0 - (min_dists / max(feather, 1)).clamp(0, 1)).unsqueeze(1)
-        else:
-            blend_w = torch.zeros(new_xyz_f.shape[0], 1, device=self.device)
-
-        # Blend: new features where mask, original features where not mask
-        final_shape_feats = shape_slat_new.feats.clone()
-        final_tex_feats = tex_slat_new.feats.clone()
-
-        # For non-mask coords with original match: blend
-        has_orig = matched & ~hr_mask_new
-        if has_orig.any():
-            oi = orig_matched_idx[has_orig]
-            w = blend_w[has_orig]
-            final_shape_feats[has_orig] = (1 - w) * orig_shape_feats[oi] + w * final_shape_feats[has_orig]
-            final_tex_feats[has_orig] = (1 - w) * orig_tex_feats[oi] + w * final_tex_feats[has_orig]
-
-        # Also feather the boundary zone (matched + in feather range)
-        boundary = matched & hr_mask_new & (blend_w.squeeze(1) < 1.0)
-        if boundary.any():
-            oi = orig_matched_idx[boundary]
-            w = blend_w[boundary]
-            final_shape_feats[boundary] = (1 - w) * orig_shape_feats[oi] + w * final_shape_feats[boundary]
-            final_tex_feats[boundary] = (1 - w) * orig_tex_feats[oi] + w * final_tex_feats[boundary]
-
-        # Add back original non-mask coords missing from new set
-        new_hash_sorted = new_hash.sort()[0]
-        orig_in_new_pos = torch.searchsorted(new_hash_sorted, orig_hash)
-        orig_in_new_pos = orig_in_new_pos.clamp(max=new_hash_sorted.shape[0] - 1)
-        orig_in_new = new_hash_sorted[orig_in_new_pos] == orig_hash
-        missing = ~orig_in_new & ~hr_mask_orig
+        # Also add missing original non-mask coords
+        hr_hash_sorted = hr_hash.sort()[0]
+        orig_in_hr_pos = torch.searchsorted(hr_hash_sorted, orig_hash)
+        orig_in_hr_pos = orig_in_hr_pos.clamp(max=hr_hash_sorted.shape[0] - 1)
+        orig_in_hr = hr_hash_sorted[orig_in_hr_pos] == orig_hash
+        orig_mask = self.create_voxel_mask_from_mesh(
+            mask_vertices, shape_slat.coords, new_res, radius=mask_radius)
+        missing = ~orig_in_hr & ~orig_mask
         n_missing = missing.sum().item()
         if n_missing > 0:
-            print(f"  Restoring {n_missing} missing original non-mask voxels")
-            missing_coords = shape_slat.coords[missing].to(self.device)
-            missing_shape = orig_shape_feats[missing]
-            missing_tex = orig_tex_feats[missing]
-            all_coords = torch.cat([shape_slat_new.coords, missing_coords])
-            final_shape_feats = torch.cat([final_shape_feats, missing_shape])
-            final_tex_feats = torch.cat([final_tex_feats, missing_tex])
-        else:
-            all_coords = shape_slat_new.coords
+            print(f"  Adding {n_missing} missing original non-mask voxels")
+            extra_coords = shape_slat.coords[missing].to(self.device)
+            hr_coords = torch.cat([hr_coords, extra_coords])
+            # Recompute hash and matching
+            hr_xyz = hr_coords[:, 1:]
+            hr_hash = coords_to_hash(hr_xyz, hr_grid)
+            orig_hash_sorted, orig_sort_idx = orig_hash.sort()
+            match_pos = torch.searchsorted(orig_hash_sorted, hr_hash)
+            match_pos = match_pos.clamp(max=orig_hash_sorted.shape[0] - 1)
+            matched = orig_hash_sorted[match_pos] == hr_hash
+            orig_matched_idx = orig_sort_idx[match_pos]
+            # Recompute mask
+            hr_mask = self.create_voxel_mask_from_mesh(
+                mask_vertices, hr_coords, new_res, radius=mask_radius)
 
-        n_full_new = (hr_mask_new & (blend_w.squeeze(1) >= 1.0)).sum().item()
-        n_blended = ((blend_w.squeeze(1) > 0) & (blend_w.squeeze(1) < 1.0)).sum().item()
-        n_orig_kept = has_orig.sum().item() - n_blended
-        print(f"  Voxels: {n_orig_kept} original, {n_blended} blended, "
-              f"{n_full_new} new, {n_missing} restored")
+        # Build inpaint_x0: original features for matched non-mask, zeros elsewhere
+        # Unmatched non-mask voxels have no original features → treat as mask
+        # (let the model generate freely instead of repaint with zeros)
+        orig_shape_feats = shape_slat.feats.to(self.device)
+        orig_tex_feats = tex_slat.feats.to(self.device)
+        shape_x0 = torch.zeros(hr_coords.shape[0], orig_shape_feats.shape[1], device=self.device)
+        shape_x0[matched] = orig_shape_feats[orig_matched_idx[matched]]
+        shape_x0 = (shape_x0 - mean) / std
 
-        stitched_shape = SparseTensor(feats=final_shape_feats, coords=all_coords)
-        stitched_tex = SparseTensor(feats=final_tex_feats, coords=all_coords)
+        # Expand mask to include unmatched non-mask voxels
+        unmatched_nonmask = ~matched & ~hr_mask
+        n_unmatched = unmatched_nonmask.sum().item()
+        if n_unmatched > 0:
+            hr_mask = hr_mask | unmatched_nonmask
+            print(f"  Expanded mask: +{n_unmatched} unmatched voxels → {hr_mask.sum().item()}/{hr_coords.shape[0]} ({100*hr_mask.sum().item()/hr_coords.shape[0]:.1f}%)")
 
-        # ── Step 6: Decode ────────────────────────────────────────
-        print("[Recreate] Step 6/6: Decoding...")
+        n_matched = matched.sum().item()
+        n_mask_matched = (matched & hr_mask).sum().item()
+        print(f"  Matched: {n_matched}/{hr_coords.shape[0]}, mask∩matched: {n_mask_matched}")
+
+        # RoPE scaling for 1536
+        shape_flow_model = self.models['shape_slat_flow_model_1024']
+        _shape_fm = getattr(shape_flow_model, '_orig_mod', shape_flow_model).to(self.device)
+        model_native_grid = 64
+        shape_saved_freqs = None
+        if hr_grid > model_native_grid:
+            rope_scale = hr_grid / model_native_grid
+            shape_saved_freqs = self._apply_ntk_rope_scaling(_shape_fm, rope_scale)
+            print(f"  NTK RoPE scaling (shape): {model_native_grid}³→{hr_grid}³ (scale={rope_scale:.1f})")
+
+        try:
+            torch.manual_seed(recreate_seed)
+            # Use underlying model if torch.compiled (avoids FakeTensor device issues)
+            _shape_fm = getattr(shape_flow_model, '_orig_mod', shape_flow_model)
+            noise_feats = torch.randn(hr_coords.shape[0], _shape_fm.in_channels).to(self.device)
+            inpaint_noise = torch.randn_like(shape_x0)
+            noise = SparseTensor(feats=noise_feats, coords=hr_coords)
+
+            shape_sampler_params = {**self.shape_slat_sampler_params, **shape_slat_sampler_params}
+            shape_result = self.shape_slat_sampler.sample(
+                _shape_fm, noise,
+                **cond_1024, **shape_sampler_params,
+                inpaint_mask=hr_mask,
+                inpaint_x0=shape_x0,
+                inpaint_noise=inpaint_noise,
+                verbose=True,
+                tqdm_desc="Recreate shape (repaint)",
+            ).samples
+            # .samples returns SparseTensor; extract feats, denormalize, rebuild
+            shape_feats_new = shape_result.feats * std + mean
+        finally:
+            if shape_saved_freqs is not None:
+                self._restore_rope_freqs(_shape_fm, shape_saved_freqs)
+
+        shape_slat_new = SparseTensor(feats=shape_feats_new, coords=hr_coords)
+
+        # Texture repaint
+        print("[Recreate] Step 4b/5: Texture repaint...")
+        tex_std = torch.tensor(self.tex_slat_normalization['std'])[None].to(self.device)
+        tex_mean = torch.tensor(self.tex_slat_normalization['mean'])[None].to(self.device)
+
+        tex_x0 = torch.zeros(hr_coords.shape[0], orig_tex_feats.shape[1], device=self.device)
+        tex_x0[matched] = orig_tex_feats[orig_matched_idx[matched]]
+        tex_x0 = (tex_x0 - tex_mean) / tex_std
+
+        shape_slat_norm = shape_slat_new.replace(
+            feats=(shape_slat_new.feats - mean) / std
+        )
+
+        tex_flow_model = self.models['tex_slat_flow_model_1024']
+        _tex_fm = getattr(tex_flow_model, '_orig_mod', tex_flow_model).to(self.device)
+        tex_saved_freqs = None
+        if hr_grid > model_native_grid:
+            tex_rope_scale = hr_grid / model_native_grid
+            tex_saved_freqs = self._apply_ntk_rope_scaling(_tex_fm, tex_rope_scale)
+            print(f"  NTK RoPE scaling (texture): {model_native_grid}³→{hr_grid}³ (scale={tex_rope_scale:.1f})")
+
+        try:
+            torch.manual_seed(recreate_seed + 1)
+            in_channels = _tex_fm.in_channels if isinstance(_tex_fm, nn.Module) else _tex_fm[0].in_channels
+            tex_noise_channels = in_channels - shape_slat_norm.feats.shape[1]
+            tex_noise_feats = torch.randn(hr_coords.shape[0], tex_noise_channels).to(self.device)
+            tex_inpaint_noise = torch.randn_like(tex_x0)
+            tex_noise = shape_slat_norm.replace(feats=tex_noise_feats)
+
+            tex_sampler_params = {**self.tex_slat_sampler_params, **tex_slat_sampler_params}
+            tex_result = self.tex_slat_sampler.sample(
+                _tex_fm, tex_noise,
+                concat_cond=shape_slat_norm,
+                **cond_1024, **tex_sampler_params,
+                inpaint_mask=hr_mask,
+                inpaint_x0=tex_x0,
+                inpaint_noise=tex_inpaint_noise,
+                verbose=True,
+                tqdm_desc="Recreate texture (repaint)",
+            ).samples
+            tex_feats_new = tex_result.feats * tex_std + tex_mean
+        finally:
+            if tex_saved_freqs is not None:
+                self._restore_rope_freqs(_tex_fm, tex_saved_freqs)
+
+        tex_slat_new = SparseTensor(feats=tex_feats_new, coords=hr_coords)
+
+        # ── Feather blend at mask boundary ────────────────────────
+        # Smooth transition between repaint-generated and original features
+        # to avoid hard boundary artifacts / holes
+        if feather > 0:
+            print(f"[Recreate] Feather blending (radius={feather})...")
+            # Use the original (non-expanded) mask for distance calculation
+            orig_hr_mask = self.create_voxel_mask_from_mesh(
+                mask_vertices, hr_coords, new_res, radius=mask_radius)
+            mask_indices = orig_hr_mask.nonzero(as_tuple=True)[0]
+            hr_xyz_f = hr_coords[:, 1:].float()
+
+            if mask_indices.numel() > 0:
+                mask_xyz_f = hr_xyz_f[mask_indices]
+                chunk_size = 4096
+                min_dists = torch.full((hr_xyz_f.shape[0],), float('inf'), device=self.device)
+                for i in range(0, mask_xyz_f.shape[0], chunk_size):
+                    mc = mask_xyz_f[i:i + chunk_size]
+                    diffs = (hr_xyz_f.unsqueeze(1) - mc.unsqueeze(0)).abs()
+                    linf = diffs.max(dim=2).values.min(dim=1).values
+                    min_dists = torch.min(min_dists, linf)
+                # 1.0 inside mask, gradient 1→0 in feather zone, 0 outside
+                blend_w = (1.0 - (min_dists / feather).clamp(0, 1)).unsqueeze(1)
+
+                # Blend: only where we have original features (matched & not in core mask)
+                boundary = matched & ~orig_hr_mask & (blend_w.squeeze(1) > 0)
+                if boundary.any():
+                    oi = orig_matched_idx[boundary]
+                    w = blend_w[boundary]
+                    blended_shape = (1 - w) * orig_shape_feats[oi] + w * shape_feats_new[boundary]
+                    blended_tex = (1 - w) * orig_tex_feats[oi] + w * tex_feats_new[boundary]
+                    shape_feats_new[boundary] = blended_shape
+                    tex_feats_new[boundary] = blended_tex
+                    print(f"  Blended {boundary.sum().item()} boundary voxels")
+
+                shape_slat_new = SparseTensor(feats=shape_feats_new, coords=hr_coords)
+                tex_slat_new = SparseTensor(feats=tex_feats_new, coords=hr_coords)
+
+        # ── Step 5: Decode ────────────────────────────────────────
+        print("[Recreate] Step 5/5: Decoding...")
         torch.cuda.empty_cache()
-        out_mesh = self.decode_latent(stitched_shape, stitched_tex, new_res)
+        out_mesh = self.decode_latent(shape_slat_new, tex_slat_new, new_res)
         if return_latent:
-            return out_mesh, (stitched_shape, stitched_tex, new_res, new_z_s)
+            return out_mesh, (shape_slat_new, tex_slat_new, new_res, new_z_s)
         return out_mesh
 
     @torch.no_grad()
