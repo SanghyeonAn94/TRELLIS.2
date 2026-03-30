@@ -645,21 +645,13 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             self.models['shape_slat_decoder'].low_vram = False
 
         actual_hr_resolution = hr_resolution
-        while True:
-            hr_grid = actual_hr_resolution // 16  # 2048//16=128
-            quant_hr_coords = torch.cat([
-                hr_raw_coords[:, :1],
-                ((hr_raw_coords[:, 1:] + 0.5) / mid_resolution * hr_grid).int(),
-            ], dim=1)
-            hr_coords = quant_hr_coords.unique(dim=0)
-            num_tokens = hr_coords.shape[0]
-            if num_tokens < max_num_tokens or actual_hr_resolution == 1024:
-                if actual_hr_resolution != hr_resolution:
-                    print(f"Due to the limited number of tokens, the resolution is reduced to {actual_hr_resolution}.")
-                break
-            actual_hr_resolution -= 128
-
         hr_grid = actual_hr_resolution // 16
+        quant_hr_coords = torch.cat([
+            hr_raw_coords[:, :1],
+            ((hr_raw_coords[:, 1:] + 0.5) / mid_resolution * hr_grid).int(),
+        ], dim=1)
+        hr_coords = quant_hr_coords.unique(dim=0)
+        print(f"  Stage 3 tokens: {hr_coords.shape[0]} (grid={hr_grid}³, no token limit)")
 
         # ============================================================
         # Stage 3: HR (1024 model reused, partial or full denoise)
@@ -892,7 +884,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         elif pipeline_type == '1024':
             assert 'shape_slat_flow_model_1024' in self.models, "No 1024 resolution shape SLat flow model found."
             assert 'tex_slat_flow_model_1024' in self.models, "No 1024 resolution texture SLat flow model found."
-        elif pipeline_type in ('1024_cascade', '1536_cascade', '2048_cascade'):
+        elif pipeline_type in ('1024_cascade', '1536_cascade', '2048_cascade', '1536_2048'):
             assert 'shape_slat_flow_model_512' in self.models, "No 512 resolution shape SLat flow model found."
             assert 'shape_slat_flow_model_1024' in self.models, "No 1024 resolution shape SLat flow model found."
             assert 'tex_slat_flow_model_1024' in self.models, "No 1024 resolution texture SLat flow model found."
@@ -912,7 +904,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             coords = override_coords
             z_s = torch.zeros(1) if return_latent else None
         else:
-            ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32, '2048_cascade': 32, '1024_1536': 64, '1024_2048': 64}[pipeline_type]
+            ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32, '2048_cascade': 32, '1536_2048': 32, '1024_1536': 64, '1024_2048': 64}[pipeline_type]
             ss_result = self.sample_sparse_structure(
                 cond_512, ss_res,
                 num_samples, sparse_structure_sampler_params,
@@ -968,6 +960,99 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 cond_1024, self.models['tex_slat_flow_model_1024'],
                 shape_slat, tex_slat_sampler_params
             )
+        elif pipeline_type == '1536_2048':
+            # Stage 1+2: 1536_cascade (96³, clean latent)
+            shape_slat_1536, mid_res = self.sample_shape_slat_cascade(
+                cond_512, cond_1024,
+                self.models['shape_slat_flow_model_512'],
+                self.models['shape_slat_flow_model_1024'],
+                512, 1536,
+                coords, shape_slat_sampler_params,
+                max_num_tokens,
+                hr_rope_scale=1536 / 1024,
+                denoise_strength=1.0,
+            )
+            # Stage 3: Upsample 96³ → 128³ + partial denoise (RoPE 1.33x)
+            print("[1536_2048] Upsampling 96³ → 128³...")
+            if self.low_vram:
+                self.models['shape_slat_decoder'].to(self.device)
+                self.models['shape_slat_decoder'].low_vram = True
+            hr_raw_coords = self.models['shape_slat_decoder'].upsample(shape_slat_1536, upsample_times=4)
+            if self.low_vram:
+                self.models['shape_slat_decoder'].cpu()
+                self.models['shape_slat_decoder'].low_vram = False
+
+            mid_grid = mid_res // 16  # 96
+            hr_grid = 2048 // 16  # 128
+            quant_hr = torch.cat([
+                hr_raw_coords[:, :1],
+                ((hr_raw_coords[:, 1:] + 0.5) / mid_res * hr_grid).int(),
+            ], dim=1)
+            hr_coords = quant_hr.unique(dim=0)
+            print(f"  HR tokens: {hr_coords.shape[0]} (grid={hr_grid}³)")
+
+            # Upsample 1536 features to 128³ coords
+            upsampled, found_mask = self._upsample_slat_features(
+                shape_slat_1536, hr_coords, mid_grid, hr_grid)
+            std = torch.tensor(self.shape_slat_normalization['std'])[None].to(self.device)
+            mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(self.device)
+            x0 = (upsampled.feats - mean) / std
+            flow_model = self.models['shape_slat_flow_model_1024']
+            _fm = getattr(flow_model, '_orig_mod', flow_model).to(self.device)
+            C_model = _fm.in_channels
+            C_feat = x0.shape[1]
+            if C_feat < C_model:
+                x0 = torch.cat([x0, torch.zeros(x0.shape[0], C_model - C_feat, device=self.device)], dim=1)
+            elif C_feat > C_model:
+                x0 = x0[:, :C_model]
+
+            t = denoise_strength
+            eps = torch.randn_like(x0)
+            noisy_input = (1 - t) * x0 + t * eps
+            noisy_input[~found_mask] = eps[~found_mask]
+
+            rope_scale = hr_grid / 64  # 128/64 = 2.0 (model native is 64³)
+            saved_freqs = None
+            if rope_scale > 1.0:
+                saved_freqs = self._apply_ntk_rope_scaling(_fm, rope_scale)
+                print(f"  NTK RoPE scaling: 64³→{hr_grid}³ (scale={rope_scale:.1f})")
+
+            try:
+                noise = SparseTensor(feats=noisy_input, coords=hr_coords)
+                hr_params = {**self.shape_slat_sampler_params, **shape_slat_sampler_params}
+                if hr_shape_slat_sampler_params:
+                    hr_params.update(hr_shape_slat_sampler_params)
+                print(f"  Stage 3: denoise_strength={denoise_strength:.2f}, start_t={denoise_strength:.2f}")
+                shape_slat = self.shape_slat_sampler.sample(
+                    _fm, noise,
+                    **cond_1024, **hr_params,
+                    start_t=denoise_strength,
+                    verbose=True,
+                    tqdm_desc="Stage 3: Sampling shape SLat (HR 2048)",
+                ).samples
+                shape_slat = shape_slat * std + mean
+            finally:
+                if saved_freqs is not None:
+                    self._restore_rope_freqs(_fm, saved_freqs)
+
+            res = 2048
+            # Texture with RoPE scaling
+            hr_grid = res // 16
+            _tex_fm = getattr(self.models['tex_slat_flow_model_1024'], '_orig_mod',
+                              self.models['tex_slat_flow_model_1024']).to(self.device)
+            tex_rope_scale = hr_grid / 64  # 128/64 = 2.0
+            tex_saved_freqs = None
+            if tex_rope_scale > 1.0:
+                tex_saved_freqs = self._apply_ntk_rope_scaling(_tex_fm, tex_rope_scale)
+                print(f"  NTK RoPE scaling (texture): 64³→{hr_grid}³ (scale={tex_rope_scale:.1f})")
+            try:
+                tex_slat = self.sample_tex_slat(
+                    cond_1024, _tex_fm,
+                    shape_slat, tex_slat_sampler_params
+                )
+            finally:
+                if tex_saved_freqs is not None:
+                    self._restore_rope_freqs(_tex_fm, tex_saved_freqs)
         elif pipeline_type == '2048_cascade':
             shape_slat, res = self.sample_shape_slat_3stage_cascade(
                 cond_512, cond_1024,
