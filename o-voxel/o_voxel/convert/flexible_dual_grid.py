@@ -10,7 +10,7 @@ __all__ = [
 
 
 def _init_hashmap(grid_size, capacity, device):
-    VOL = (grid_size[0] * grid_size[1] * grid_size[2]).item()
+    VOL = int(grid_size[0].item()) * int(grid_size[1].item()) * int(grid_size[2].item())
         
     # If the number of elements in the tensor is less than 2^32, use uint32 as the hashmap type, otherwise use uint64.
     if VOL < 2**32:
