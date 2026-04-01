@@ -645,13 +645,20 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             self.models['shape_slat_decoder'].low_vram = False
 
         actual_hr_resolution = hr_resolution
-        hr_grid = actual_hr_resolution // 16
-        quant_hr_coords = torch.cat([
-            hr_raw_coords[:, :1],
-            ((hr_raw_coords[:, 1:] + 0.5) / mid_resolution * hr_grid).int(),
-        ], dim=1)
-        hr_coords = quant_hr_coords.unique(dim=0)
-        print(f"  Stage 3 tokens: {hr_coords.shape[0]} (grid={hr_grid}³, no token limit)")
+        while True:
+            hr_grid = actual_hr_resolution // 16
+            quant_hr_coords = torch.cat([
+                hr_raw_coords[:, :1],
+                ((hr_raw_coords[:, 1:] + 0.5) / mid_resolution * hr_grid).int(),
+            ], dim=1)
+            hr_coords = quant_hr_coords.unique(dim=0)
+            num_tokens = hr_coords.shape[0]
+            if num_tokens < max_num_tokens or actual_hr_resolution == 1024:
+                if actual_hr_resolution != hr_resolution:
+                    print(f"Due to the limited number of tokens, the resolution is reduced to {actual_hr_resolution}.")
+                break
+            actual_hr_resolution -= 128
+        print(f"  Stage 3 tokens: {hr_coords.shape[0]} (grid={hr_grid}³)")
 
         # ============================================================
         # Stage 3: HR (1024 model reused, partial or full denoise)
@@ -1458,6 +1465,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         recreate_ss_sampler_params: Optional[dict] = None,
         ss_start_t: float = 0.5,
         return_latent: bool = False,
+        skip_stage0: bool = False,
     ) -> List[MeshWithVoxel]:
         """
         Recreate: regenerate sparse structure (Stage 0) in the masked region,
@@ -1497,82 +1505,86 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             recreate_ss_sampler_params = sparse_structure_sampler_params
 
         preprocessed = self.preprocess_image(image)
-        z_s = z_s.to(self.device)
 
-        # ── Step 1: Create dense 3D mask at latent resolution ─────
-        print("[Recreate] Step 1/6: Creating dense structure mask...")
-        flow_model = self.models['sparse_structure_flow_model']
-        latent_res = flow_model.resolution  # 16
-        decoder = self.models['sparse_structure_decoder']
+        if skip_stage0:
+            # External mesh: skip Stage 0, use existing coords directly
+            print("[Recreate] Skipping Stage 0 (external mesh, no z_s)")
+            new_z_s = z_s  # pass through (may be dummy)
+            merged_coords = shape_slat.coords  # use encoder's coords as-is
+        else:
+            z_s = z_s.to(self.device)
 
-        if self.low_vram:
-            decoder.to(self.device)
-        orig_decoded = decoder(z_s) > 0  # [B, 1, D, D, D]
-        if self.low_vram:
-            decoder.cpu()
-        decoded_res = orig_decoded.shape[2]
+            # ── Step 1: Create dense 3D mask at latent resolution ─────
+            print("[Recreate] Step 1/6: Creating dense structure mask...")
+            flow_model = self.models['sparse_structure_flow_model']
+            latent_res = flow_model.resolution  # 16
+            decoder = self.models['sparse_structure_decoder']
 
-        mask_latent = self.create_dense_structure_mask(
-            mask_vertices, latent_res=latent_res, decoded_res=decoded_res,
-            radius=mask_radius, device=self.device,
-        )
-        print(f"  Latent mask: {mask_latent.sum().item()}/{mask_latent.numel()} "
-              f"({100*mask_latent.sum().item()/mask_latent.numel():.1f}%)")
+            if self.low_vram:
+                decoder.to(self.device)
+            orig_decoded = decoder(z_s) > 0  # [B, 1, D, D, D]
+            if self.low_vram:
+                decoder.cpu()
+            decoded_res = orig_decoded.shape[2]
 
-        mask_decoded = self.create_dense_structure_mask(
-            mask_vertices, latent_res=decoded_res, decoded_res=decoded_res,
-            radius=mask_radius, device=self.device,
-        )
+            mask_latent = self.create_dense_structure_mask(
+                mask_vertices, latent_res=latent_res, decoded_res=decoded_res,
+                radius=mask_radius, device=self.device,
+            )
+            print(f"  Latent mask: {mask_latent.sum().item()}/{mask_latent.numel()} "
+                  f"({100*mask_latent.sum().item()/mask_latent.numel():.1f}%)")
 
-        # ── Step 2: Stage 0 SDEdit + inpainting ─────────────────
-        print(f"[Recreate] Step 2/6: Recreating sparse structure (ss_start_t={ss_start_t})...")
-        cond_512 = self.get_cond([preprocessed], 512)
-        ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32,
-                  '2048_cascade': 32, '1024_1536': 64, '1024_2048': 64}[pipeline_type]
+            mask_decoded = self.create_dense_structure_mask(
+                mask_vertices, latent_res=decoded_res, decoded_res=decoded_res,
+                radius=mask_radius, device=self.device,
+            )
 
-        torch.manual_seed(recreate_seed)
-        inpaint_noise = torch.randn_like(z_s)
+            # ── Step 2: Stage 0 SDEdit + inpainting ─────────────────
+            print(f"[Recreate] Step 2/6: Recreating sparse structure (ss_start_t={ss_start_t})...")
+            cond_512 = self.get_cond([preprocessed], 512)
+            ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32,
+                      '2048_cascade': 32, '1536_2048': 32, '1024_1536': 64, '1024_2048': 64}[pipeline_type]
 
-        # SDEdit: start from noised z_s instead of pure noise
-        # This seeds the mask region with existing structure so the model
-        # modifies rather than generates from scratch
-        sigma_min = self.sparse_structure_sampler.sigma_min
-        sigma_start = sigma_min + (1 - sigma_min) * ss_start_t
-        start_noise = (1 - ss_start_t) * z_s + sigma_start * inpaint_noise
+            torch.manual_seed(recreate_seed)
+            inpaint_noise = torch.randn_like(z_s)
 
-        ss_params = {**recreate_ss_sampler_params, 'start_t': ss_start_t}
-        new_coords, new_z_s = self.sample_sparse_structure(
-            cond_512, ss_res,
-            num_samples=1,
-            sampler_params=ss_params,
-            return_latent=True,
-            inpaint_mask=mask_latent,
-            inpaint_x0=z_s,
-            inpaint_noise=inpaint_noise,
-            start_noise=start_noise,
-        )
+            sigma_min = self.sparse_structure_sampler.sigma_min
+            sigma_start = sigma_min + (1 - sigma_min) * ss_start_t
+            start_noise = (1 - ss_start_t) * z_s + sigma_start * inpaint_noise
 
-        if self.low_vram:
-            decoder.to(self.device)
-        new_decoded = decoder(new_z_s) > 0
-        if self.low_vram:
-            decoder.cpu()
+            ss_params = {**recreate_ss_sampler_params, 'start_t': ss_start_t}
+            new_coords, new_z_s = self.sample_sparse_structure(
+                cond_512, ss_res,
+                num_samples=1,
+                sampler_params=ss_params,
+                return_latent=True,
+                inpaint_mask=mask_latent,
+                inpaint_x0=z_s,
+                inpaint_noise=inpaint_noise,
+                start_noise=start_noise,
+            )
 
-        # ── Step 3: Merge occupancy ───────────────────────────────
-        print("[Recreate] Step 3/6: Merging occupancy...")
-        orig_in_mask = int((orig_decoded & mask_decoded).sum())
-        new_in_mask = int((new_decoded & mask_decoded).sum())
-        print(f"  Occupancy in mask: {orig_in_mask} (orig) → {new_in_mask} (new)")
+            if self.low_vram:
+                decoder.to(self.device)
+            new_decoded = decoder(new_z_s) > 0
+            if self.low_vram:
+                decoder.cpu()
 
-        merged_decoded = torch.where(mask_decoded, new_decoded, orig_decoded)
+            # ── Step 3: Merge occupancy ───────────────────────────────
+            print("[Recreate] Step 3/6: Merging occupancy...")
+            orig_in_mask = int((orig_decoded & mask_decoded).sum())
+            new_in_mask = int((new_decoded & mask_decoded).sum())
+            print(f"  Occupancy in mask: {orig_in_mask} (orig) → {new_in_mask} (new)")
 
-        if ss_res != merged_decoded.shape[2]:
-            ratio = merged_decoded.shape[2] // ss_res
-            merged_decoded = torch.nn.functional.max_pool3d(
-                merged_decoded.float(), ratio, ratio, 0
-            ) > 0.5
-        merged_coords = torch.argwhere(merged_decoded)[:, [0, 2, 3, 4]].int()
-        print(f"  Merged coarse voxels: {merged_coords.shape[0]}")
+            merged_decoded = torch.where(mask_decoded, new_decoded, orig_decoded)
+
+            if ss_res != merged_decoded.shape[2]:
+                ratio = merged_decoded.shape[2] // ss_res
+                merged_decoded = torch.nn.functional.max_pool3d(
+                    merged_decoded.float(), ratio, ratio, 0
+                ) > 0.5
+            merged_coords = torch.argwhere(merged_decoded)[:, [0, 2, 3, 4]].int()
+            print(f"  Merged coarse voxels: {merged_coords.shape[0]}")
 
         # ── Step 4: Build merged HR coords + repaint features ─────
         # Instead of cascade (which generates all features from scratch and
@@ -1586,41 +1598,48 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         hr_grid = new_res // 16
 
         cond_1024 = self.get_cond([preprocessed], 1024)
-
-        # Upsample merged coarse coords to HR via decoder
-        # First run LR flow to get features for upsampling
-        torch.manual_seed(recreate_seed)
-        _lr_fm = getattr(self.models['shape_slat_flow_model_512'], '_orig_mod',
-                         self.models['shape_slat_flow_model_512']).to(self.device)
-        lr_noise = SparseTensor(
-            feats=torch.randn(merged_coords.shape[0],
-                              _lr_fm.in_channels).to(self.device),
-            coords=merged_coords,
-        )
-        lr_sampler_params = {**self.shape_slat_sampler_params, **shape_slat_sampler_params}
-        lr_slat = self.shape_slat_sampler.sample(
-            _lr_fm,
-            lr_noise, **cond_512, **lr_sampler_params,
-            verbose=True, tqdm_desc="Recreate LR shape",
-        ).samples
         std = torch.tensor(self.shape_slat_normalization['std'])[None].to(self.device)
         mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(self.device)
-        lr_slat = lr_slat * std + mean
 
-        # Upsample to HR coords
-        if self.low_vram:
-            self.models['shape_slat_decoder'].to(self.device)
-            self.models['shape_slat_decoder'].low_vram = True
-        hr_coords_raw = self.models['shape_slat_decoder'].upsample(lr_slat, upsample_times=4)
-        if self.low_vram:
-            self.models['shape_slat_decoder'].cpu()
-            self.models['shape_slat_decoder'].low_vram = False
-        quant_coords = torch.cat([
-            hr_coords_raw[:, :1],
-            ((hr_coords_raw[:, 1:] + 0.5) / 512 * hr_grid).int(),
-        ], dim=1)
-        hr_coords = quant_coords.unique(dim=0)
-        print(f"  HR coords: {hr_coords.shape[0]} voxels (grid={hr_grid})")
+        if skip_stage0:
+            # External mesh: encoder already provides HR coords
+            hr_coords = shape_slat.coords.to(self.device)
+            print(f"  Using encoder coords: {hr_coords.shape[0]} voxels (grid={hr_grid})")
+        else:
+            # Upsample merged coarse coords to HR via decoder
+            # First run LR flow to get features for upsampling
+            torch.manual_seed(recreate_seed)
+            cond_512 = self.get_cond([preprocessed], 512)
+            _lr_fm = getattr(self.models['shape_slat_flow_model_512'], '_orig_mod',
+                             self.models['shape_slat_flow_model_512']).to(self.device)
+            lr_noise = SparseTensor(
+                feats=torch.randn(merged_coords.shape[0],
+                                  _lr_fm.in_channels).to(self.device),
+                coords=merged_coords,
+            )
+            lr_sampler_params = {**self.shape_slat_sampler_params, **shape_slat_sampler_params}
+            lr_slat = self.shape_slat_sampler.sample(
+                _lr_fm,
+                lr_noise, **cond_512, **lr_sampler_params,
+                verbose=True, tqdm_desc="Recreate LR shape",
+            ).samples
+            lr_slat = lr_slat * std + mean
+
+            # Upsample to HR coords
+            lr_res = 512  # LR model resolution
+            if self.low_vram:
+                self.models['shape_slat_decoder'].to(self.device)
+                self.models['shape_slat_decoder'].low_vram = True
+            hr_coords_raw = self.models['shape_slat_decoder'].upsample(lr_slat, upsample_times=4)
+            if self.low_vram:
+                self.models['shape_slat_decoder'].cpu()
+                self.models['shape_slat_decoder'].low_vram = False
+            quant_coords = torch.cat([
+                hr_coords_raw[:, :1],
+                ((hr_coords_raw[:, 1:] + 0.5) / lr_res * hr_grid).int(),
+            ], dim=1)
+            hr_coords = quant_coords.unique(dim=0)
+            print(f"  HR coords: {hr_coords.shape[0]} voxels (grid={hr_grid})")
 
         # Create mask on HR coords
         hr_mask = self.create_voxel_mask_from_mesh(
