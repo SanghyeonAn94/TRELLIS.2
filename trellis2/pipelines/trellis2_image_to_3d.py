@@ -1602,9 +1602,31 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(self.device)
 
         if skip_stage0:
-            # External mesh: encoder already provides HR coords
-            hr_coords = shape_slat.coords.to(self.device)
-            print(f"  Using encoder coords: {hr_coords.shape[0]} voxels (grid={hr_grid})")
+            # External mesh: encoder provides 64³ coords (1024 grid)
+            # Upsample to 128³ (2048 grid) for higher quality, like Stage 2→3 in cascade
+            # Compute actual encoder grid from shape_slat coords (not res, which may be upscaled)
+            enc_grid = int(shape_slat.coords[:, 1:].max().item()) + 1
+            print(f"  Upsampling encoder coords {enc_grid}³ → {hr_grid}³...")
+            if hr_grid > enc_grid:
+                if self.low_vram:
+                    self.models['shape_slat_decoder'].to(self.device)
+                    self.models['shape_slat_decoder'].low_vram = True
+                hr_raw = self.models['shape_slat_decoder'].upsample(shape_slat, upsample_times=4)
+                if self.low_vram:
+                    self.models['shape_slat_decoder'].cpu()
+                    self.models['shape_slat_decoder'].low_vram = False
+                enc_res = enc_grid * 16  # actual encoder resolution (e.g. 1024)
+                quant = torch.cat([
+                    hr_raw[:, :1],
+                    ((hr_raw[:, 1:] + 0.5) / enc_res * hr_grid).int(),
+                ], dim=1)
+                hr_coords = quant.unique(dim=0)
+                print(f"  Upsampled: {hr_coords.shape[0]} voxels (grid={hr_grid})")
+                new_res = hr_grid * 16  # e.g. 2048
+            else:
+                hr_coords = shape_slat.coords.to(self.device)
+                new_res = res
+                print(f"  Using encoder coords: {hr_coords.shape[0]} voxels (grid={hr_grid})")
         else:
             # Upsample merged coarse coords to HR via decoder
             # First run LR flow to get features for upsampling
